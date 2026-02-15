@@ -1,8 +1,8 @@
-import { Settings, Grid3X3, Bookmark, Heart, LogOut, Camera, X, Loader2, Play } from "lucide-react";
+import { Settings, Grid3X3, Bookmark, Heart, LogOut, Camera, X, Loader2, Play, ArrowLeft } from "lucide-react";
 import { useState, useRef } from "react";
 import { useAuth } from "@/hooks/useAuth";
-import { useProfile, useFollowCounts, useUserVideos, useLikedVideos, useBookmarkedVideos, useUpdateProfile } from "@/hooks/useData";
-import { useNavigate } from "react-router-dom";
+import { useProfile, useFollowCounts, useUserVideos, useLikedVideos, useBookmarkedVideos, useUpdateProfile, useIsFollowing, useToggleFollow } from "@/hooks/useData";
+import { useNavigate, useParams } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -12,16 +12,24 @@ import { Textarea } from "@/components/ui/textarea";
 const Profile = () => {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
-  const { data: profile } = useProfile(user?.id);
-  const { data: counts } = useFollowCounts(user?.id);
-  const { data: videos } = useUserVideos(user?.id);
-  const { data: likedVideos } = useLikedVideos(user?.id);
-  const { data: bookmarkedVideos } = useBookmarkedVideos(user?.id);
+  const { userId: paramUserId } = useParams<{ userId: string }>();
+
+  // Determine whose profile we're viewing
+  const viewingUserId = paramUserId || user?.id;
+  const isOwnProfile = !paramUserId || paramUserId === user?.id;
+
+  const { data: profile } = useProfile(viewingUserId);
+  const { data: counts } = useFollowCounts(viewingUserId);
+  const { data: videos } = useUserVideos(viewingUserId);
+  const { data: likedVideos } = useLikedVideos(isOwnProfile ? user?.id : undefined);
+  const { data: bookmarkedVideos } = useBookmarkedVideos(isOwnProfile ? user?.id : undefined);
+  const { data: isFollowing } = useIsFollowing(paramUserId);
+  const toggleFollow = useToggleFollow();
   const updateProfile = useUpdateProfile();
   const [activeTab, setActiveTab] = useState<"videos" | "liked" | "saved">("videos");
   const [showEditModal, setShowEditModal] = useState(false);
 
-  if (!user) {
+  if (!viewingUserId) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center bg-background pb-20 gap-4">
         <p className="text-muted-foreground">Sign in to see your profile</p>
@@ -35,15 +43,23 @@ const Profile = () => {
     );
   }
 
-  const tabs = [
-    { id: "videos" as const, icon: Grid3X3, label: "Videos" },
-    { id: "liked" as const, icon: Heart, label: "Liked" },
-    { id: "saved" as const, icon: Bookmark, label: "Saved" },
-  ];
+  const tabs = isOwnProfile
+    ? [
+        { id: "videos" as const, icon: Grid3X3, label: "Videos" },
+        { id: "liked" as const, icon: Heart, label: "Liked" },
+        { id: "saved" as const, icon: Bookmark, label: "Saved" },
+      ]
+    : [{ id: "videos" as const, icon: Grid3X3, label: "Videos" }];
 
   const handleSignOut = async () => {
     await signOut();
     navigate("/");
+  };
+
+  const handleFollow = () => {
+    if (!user) { navigate("/auth"); return; }
+    if (!paramUserId) return;
+    toggleFollow.mutate({ targetUserId: paramUserId, isFollowing: !!isFollowing });
   };
 
   const currentVideos =
@@ -57,10 +73,19 @@ const Profile = () => {
     <div className="min-h-screen bg-background pb-20">
       {/* Header */}
       <div className="flex items-center justify-between px-4 pt-4">
-        <span className="text-lg font-bold text-foreground">@{profile?.username || "you"}</span>
-        <button onClick={handleSignOut} className="rounded-lg bg-secondary p-2">
-          <LogOut className="h-4 w-4 text-foreground" />
-        </button>
+        <div className="flex items-center gap-3">
+          {!isOwnProfile && (
+            <button onClick={() => navigate(-1)}>
+              <ArrowLeft className="h-5 w-5 text-foreground" />
+            </button>
+          )}
+          <span className="text-lg font-bold text-foreground">@{profile?.username || "user"}</span>
+        </div>
+        {isOwnProfile && (
+          <button onClick={handleSignOut} className="rounded-lg bg-secondary p-2">
+            <LogOut className="h-4 w-4 text-foreground" />
+          </button>
+        )}
       </div>
 
       {/* Profile Info */}
@@ -92,21 +117,37 @@ const Profile = () => {
 
         {/* Actions */}
         <div className="mt-4 flex gap-2">
-          <button
-            onClick={() => setShowEditModal(true)}
-            className="rounded-lg bg-secondary px-8 py-2 text-sm font-semibold text-secondary-foreground"
-          >
-            Edit profile
-          </button>
-          <button
-            onClick={() => {
-              navigator.clipboard.writeText(window.location.origin + "/profile");
-              toast.success("Profile link copied!");
-            }}
-            className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold text-secondary-foreground"
-          >
-            Share
-          </button>
+          {isOwnProfile ? (
+            <>
+              <button
+                onClick={() => setShowEditModal(true)}
+                className="rounded-lg bg-secondary px-8 py-2 text-sm font-semibold text-secondary-foreground"
+              >
+                Edit profile
+              </button>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(window.location.origin + "/profile");
+                  toast.success("Profile link copied!");
+                }}
+                className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold text-secondary-foreground"
+              >
+                Share
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={handleFollow}
+              disabled={toggleFollow.isPending}
+              className={`rounded-lg px-8 py-2 text-sm font-semibold ${
+                isFollowing
+                  ? "bg-secondary text-secondary-foreground"
+                  : "bg-primary text-primary-foreground"
+              }`}
+            >
+              {isFollowing ? "Following" : "Follow"}
+            </button>
+          )}
         </div>
 
         <p className="mt-3 px-8 text-center text-sm text-muted-foreground">{profile?.bio || "No bio yet."}</p>
@@ -134,12 +175,7 @@ const Profile = () => {
             {video.thumbnail_url ? (
               <img src={video.thumbnail_url} alt="" className="h-full w-full object-cover" loading="lazy" />
             ) : video.video_url ? (
-              <video
-                src={video.video_url}
-                className="h-full w-full object-cover"
-                muted
-                preload="metadata"
-              />
+              <video src={video.video_url} className="h-full w-full object-cover" muted preload="metadata" />
             ) : (
               <div className="flex h-full items-center justify-center">
                 <Play className="h-6 w-6 text-muted-foreground" />
@@ -159,10 +195,10 @@ const Profile = () => {
       </div>
 
       {/* Edit Profile Modal */}
-      {showEditModal && (
+      {showEditModal && isOwnProfile && (
         <EditProfileModal
           profile={profile}
-          userId={user.id}
+          userId={user!.id}
           onClose={() => setShowEditModal(false)}
           onUpdate={updateProfile}
         />
@@ -239,7 +275,6 @@ function EditProfileModal({
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-background">
-      {/* Header */}
       <div className="flex items-center justify-between border-b border-border px-4 py-3">
         <button onClick={onClose}>
           <X className="h-5 w-5 text-foreground" />
@@ -251,20 +286,9 @@ function EditProfileModal({
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6">
-        {/* Avatar */}
         <div className="flex flex-col items-center gap-3">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            className="hidden"
-            onChange={handleAvatarUpload}
-          />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="relative h-24 w-24 rounded-full bg-secondary overflow-hidden"
-            disabled={uploadingAvatar}
-          >
+          <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleAvatarUpload} />
+          <button onClick={() => fileInputRef.current?.click()} className="relative h-24 w-24 rounded-full bg-secondary overflow-hidden" disabled={uploadingAvatar}>
             {avatarPreview ? (
               <img src={avatarPreview} alt="" className="h-full w-full object-cover" />
             ) : (
@@ -273,44 +297,24 @@ function EditProfileModal({
               </div>
             )}
             <div className="absolute inset-0 flex items-center justify-center bg-black/30">
-              {uploadingAvatar ? (
-                <Loader2 className="h-5 w-5 animate-spin text-white" />
-              ) : (
-                <Camera className="h-5 w-5 text-white" />
-              )}
+              {uploadingAvatar ? <Loader2 className="h-5 w-5 animate-spin text-white" /> : <Camera className="h-5 w-5 text-white" />}
             </div>
           </button>
           <p className="text-xs text-muted-foreground">Change photo</p>
         </div>
 
-        {/* Fields */}
         <div className="space-y-4">
           <div>
             <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Display Name</label>
-            <Input
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              maxLength={50}
-            />
+            <Input value={displayName} onChange={(e) => setDisplayName(e.target.value)} maxLength={50} />
           </div>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Username</label>
-            <Input
-              value={username}
-              onChange={(e) => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))}
-              maxLength={30}
-            />
+            <Input value={username} onChange={(e) => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))} maxLength={30} />
           </div>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Bio</label>
-            <Textarea
-              value={bio}
-              onChange={(e) => setBio(e.target.value)}
-              maxLength={150}
-              rows={3}
-              className="resize-none"
-              placeholder="Tell the world about yourself..."
-            />
+            <Textarea value={bio} onChange={(e) => setBio(e.target.value)} maxLength={150} rows={3} className="resize-none" placeholder="Tell the world about yourself..." />
             <p className="mt-1 text-right text-[10px] text-muted-foreground">{bio.length}/150</p>
           </div>
         </div>
@@ -320,3 +324,4 @@ function EditProfileModal({
 }
 
 export default Profile;
+

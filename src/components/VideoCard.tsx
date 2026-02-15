@@ -165,11 +165,13 @@ const VideoCard = ({ video, isLiked, isBookmarked }: VideoCardProps) => {
       {/* Right side actions */}
       <div className="absolute bottom-28 right-3 flex flex-col items-center gap-5">
         <div className="relative">
-          <img
-            src={avatarUrl}
-            alt={profile?.display_name || "user"}
-            className="h-12 w-12 rounded-full border-2 border-foreground object-cover"
-          />
+          <button onClick={() => navigate(`/profile/${video.user_id}`)} className="block">
+            <img
+              src={avatarUrl}
+              alt={profile?.display_name || "user"}
+              className="h-12 w-12 rounded-full border-2 border-foreground object-cover"
+            />
+          </button>
           <button className="absolute -bottom-2 left-1/2 -translate-x-1/2 flex h-5 w-5 items-center justify-center rounded-full bg-primary">
             <Plus className="h-3 w-3 text-primary-foreground" />
           </button>
