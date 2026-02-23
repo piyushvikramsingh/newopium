@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import {
   ArrowLeft,
   Send,
@@ -37,8 +37,10 @@ import {
   useConversations,
   useUpdateConversationSettings,
   useMarkConversationDelivered,
+  type ConversationSettings,
 } from "@/hooks/useMessages";
 import { useAuth } from "@/hooks/useAuth";
+import { useLogMessageRequestAction } from "@/hooks/useData";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import SnapCamera from "@/components/SnapCamera";
@@ -61,6 +63,38 @@ interface ChatViewProps {
   onBack: () => void;
 }
 
+type ChatReaction = {
+  id: string;
+  user_id: string;
+  emoji: string;
+};
+
+type ChatReply = {
+  deleted_at?: string | null;
+  content?: string | null;
+};
+
+type ChatMessage = {
+  id: string;
+  sender_id: string;
+  created_at: string;
+  content?: string | null;
+  media_url?: string | null;
+  media_type?: string | null;
+  is_snap?: boolean | null;
+  viewed?: boolean | null;
+  snap_duration?: number | null;
+  status?: string | null;
+  edited_at?: string | null;
+  deleted_at?: string | null;
+  reactions?: ChatReaction[];
+  reply?: ChatReply | null;
+};
+
+type TimelineRow =
+  | { type: "day"; key: string; label: string }
+  | { type: "message"; key: string; message: ChatMessage };
+
 const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
   const { user } = useAuth();
   const { data: messages, isLoading } = useMessages(conversationId);
@@ -75,6 +109,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
   const editMessage = useEditMessage();
   const deleteMessage = useDeleteMessage();
   const updateConversationSettings = useUpdateConversationSettings();
+  const logMessageRequestAction = useLogMessageRequestAction();
 
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -94,7 +129,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [isRecordingLocked, setIsRecordingLocked] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const [replyTo, setReplyTo] = useState<any | null>(null);
+  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [showSnapCamera, setShowSnapCamera] = useState(false);
   const [viewingSnap, setViewingSnap] = useState<{
@@ -113,7 +148,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
   const localCallStreamRef = useRef<MediaStream | null>(null);
   const remoteCallStreamRef = useRef<MediaStream | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const signalingChannelRef = useRef<any>(null);
+  const signalingChannelRef = useRef<{ send: (payload: unknown) => Promise<unknown> } | null>(null);
   const currentCallIdRef = useRef<string | null>(null);
   const callStatusRef = useRef<"idle" | "incoming" | "calling" | "connecting" | "active">("idle");
   const callTimerRef = useRef<number | null>(null);
@@ -127,9 +162,18 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
   const readMarkRef = useRef<string | null>(null);
   const deliveredMarkRef = useRef<string | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
+  const typingStateRef = useRef<boolean>(false);
+  const sendSignalRef = useRef<(event: string, payload: Record<string, unknown>) => Promise<void>>(async () => {});
+  const handleEndCallRef = useRef<(notifyRemote?: boolean) => void>(() => {});
 
-  const conversation = (allConversations || []).find((item: any) => item.id === conversationId);
-  const conversationSettings = conversation?.settings || { pinned: false, muted: false, archived: false };
+  const conversation = (allConversations || []).find((item) => item?.id === conversationId);
+  const conversationSettings: ConversationSettings = {
+    pinned: !!conversation?.settings?.pinned,
+    muted: !!conversation?.settings?.muted,
+    archived: !!conversation?.settings?.archived,
+    accepted_request: !!conversation?.settings?.accepted_request,
+  };
+  const isMessageRequestChat = !!conversation?.isMessageRequest && !conversationSettings.accepted_request && !conversationSettings.archived;
 
   const safeOtherUser = {
     user_id: otherUser?.user_id || "unknown",
@@ -137,6 +181,12 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
     display_name: otherUser?.display_name || "Unknown User",
     avatar_url: otherUser?.avatar_url || null,
   };
+
+  useEffect(() => {
+    readMarkRef.current = null;
+    deliveredMarkRef.current = null;
+    typingStateRef.current = false;
+  }, [conversationId]);
 
   const avatarUrl = safeOtherUser.avatar_url || `https://i.pravatar.cc/100?u=${safeOtherUser.user_id}`;
   const hasTypedText = text.trim().length > 0;
@@ -161,11 +211,11 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
   };
 
   const timeline = useMemo(() => {
-    const list = messages ?? [];
-    const rows: Array<{ type: "day"; key: string; label: string } | { type: "message"; key: string; message: any }> = [];
+    const list = (messages ?? []) as ChatMessage[];
+    const rows: TimelineRow[] = [];
     let lastDay = "";
 
-    list.forEach((msg: any) => {
+    list.forEach((msg) => {
       const label = dayLabel(msg.created_at);
       if (label !== lastDay) {
         rows.push({ type: "day", key: `day-${msg.id}`, label });
@@ -179,7 +229,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
 
   const lastOutgoingMessageId = useMemo(() => {
     if (!messages || !user) return null;
-    const latestMine = [...messages].reverse().find((message: any) => message.sender_id === user.id && !message.is_snap);
+    const latestMine = [...(messages as ChatMessage[])].reverse().find((message) => message.sender_id === user.id && !message.is_snap);
     return latestMine?.id ?? null;
   }, [messages, user]);
 
@@ -215,7 +265,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
         if (!payload || payload.toUserId !== user.id || payload.fromUserId === user.id) return;
 
         if (callStatusRef.current !== "idle") {
-          await sendSignal("call-reject", {
+          await sendSignalRef.current("call-reject", {
             callId: payload.callId,
             fromUserId: user.id,
             toUserId: payload.fromUserId,
@@ -244,7 +294,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
           setCallStatus("connecting");
         } catch {
           toast.error("Failed to connect call");
-          handleEndCall(false);
+          handleEndCallRef.current(false);
         }
       })
       .on("broadcast", { event: "call-ice" }, async ({ payload }) => {
@@ -263,13 +313,13 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
         if (!payload || payload.toUserId !== user.id || payload.fromUserId === user.id) return;
         if (payload.callId !== currentCallIdRef.current) return;
         toast.info("Call ended");
-        handleEndCall(false);
+        handleEndCallRef.current(false);
       })
       .on("broadcast", { event: "call-reject" }, ({ payload }) => {
         if (!payload || payload.toUserId !== user.id || payload.fromUserId === user.id) return;
         if (payload.callId !== currentCallIdRef.current) return;
         toast.error("Call declined");
-        handleEndCall(false);
+        handleEndCallRef.current(false);
       })
       .subscribe();
 
@@ -288,31 +338,33 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
 
   useEffect(() => {
     if (!messages || !user) return;
+    if (markConversationRead.isPending) return;
 
     const lastIncoming = [...messages]
       .reverse()
-      .find((msg: any) => msg.sender_id !== user.id);
+      .find((msg: ChatMessage) => msg.sender_id !== user.id);
 
     if (!lastIncoming) return;
     if (readMarkRef.current === lastIncoming.id) return;
 
     readMarkRef.current = lastIncoming.id;
     markConversationRead.mutate({ conversationId });
-  }, [messages, user, conversationId]);
+  }, [messages, user, conversationId, markConversationRead]);
 
   useEffect(() => {
     if (!messages || !user) return;
+    if (markConversationDelivered.isPending) return;
 
     const lastPendingDelivery = [...messages]
       .reverse()
-      .find((message: any) => message.sender_id !== user.id && message.status === "sent" && !message.is_snap);
+      .find((message: ChatMessage) => message.sender_id !== user.id && message.status === "sent" && !message.is_snap);
 
     if (!lastPendingDelivery) return;
     if (deliveredMarkRef.current === lastPendingDelivery.id) return;
 
     deliveredMarkRef.current = lastPendingDelivery.id;
     markConversationDelivered.mutate({ conversationId });
-  }, [messages, user, conversationId]);
+  }, [messages, user, conversationId, markConversationDelivered]);
 
   useEffect(() => {
     return () => {
@@ -326,19 +378,25 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
     setText(value);
     if (!conversationId || !user) return;
 
-    setTypingStatus.mutate({ conversationId, isTyping: value.trim().length > 0 });
+    const isTyping = value.trim().length > 0;
+    if (typingStateRef.current !== isTyping) {
+      typingStateRef.current = isTyping;
+      setTypingStatus.mutate({ conversationId, isTyping });
+    }
 
     if (typingTimeoutRef.current) {
       window.clearTimeout(typingTimeoutRef.current);
     }
 
     typingTimeoutRef.current = window.setTimeout(() => {
+      if (!typingStateRef.current) return;
+      typingStateRef.current = false;
       setTypingStatus.mutate({ conversationId, isTyping: false });
     }, 1200);
   };
 
-  const handleReaction = (message: any, emoji: string) => {
-    const existing = (message.reactions || []).find((reaction: any) => reaction.user_id === user?.id);
+  const handleReaction = (message: ChatMessage, emoji: string) => {
+    const existing = (message.reactions || []).find((reaction) => reaction.user_id === user?.id);
     toggleReaction.mutate({
       conversationId,
       messageId: message.id,
@@ -361,6 +419,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
   };
 
   const handleToggleSetting = async (key: "pinned" | "muted" | "archived") => {
+    if (updateConversationSettings.isPending) return;
     try {
       await updateConversationSettings.mutateAsync({
         conversationId,
@@ -372,7 +431,30 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
     }
   };
 
+  const handleMessageRequestAction = async (action: "accept" | "delete") => {
+    if (updateConversationSettings.isPending) return;
+    try {
+      await updateConversationSettings.mutateAsync({
+        conversationId,
+        updates:
+          action === "accept"
+            ? { ...conversationSettings, accepted_request: true, archived: false }
+            : { ...conversationSettings, archived: true },
+      });
+      await logMessageRequestAction.mutateAsync({
+        conversationId,
+        action,
+        surface: "chat-banner",
+      });
+      toast.success(action === "accept" ? "Message request accepted" : "Message request deleted");
+      if (action === "delete") onBack();
+    } catch {
+      toast.error("Failed to update request");
+    }
+  };
+
   const handleSend = async () => {
+    if (!conversationId || !user) return;
     const trimmed = text.trim();
     if (!trimmed || sending) return;
 
@@ -397,7 +479,10 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
       setText("");
       setReplyTo(null);
       setEditingMessageId(null);
-      setTypingStatus.mutate({ conversationId, isTyping: false });
+      if (typingStateRef.current) {
+        typingStateRef.current = false;
+        setTypingStatus.mutate({ conversationId, isTyping: false });
+      }
     } catch {
       toast.error("Failed to send");
     } finally {
@@ -429,8 +514,9 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
       });
       setShowSnapCamera(false);
       toast.success("Snap sent 🔥");
-    } catch (err: any) {
-      toast.error(err.message || "Failed to send snap");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to send snap";
+      toast.error(message || "Failed to send snap");
     } finally {
       setSending(false);
     }
@@ -467,15 +553,16 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
         content: text.trim() || undefined,
       });
       setText("");
-    } catch (err: any) {
-      toast.error(err.message || "Upload failed");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Upload failed";
+      toast.error(message || "Upload failed");
     } finally {
       setSending(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
-  const handleOpenSnap = (msg: any) => {
+  const handleOpenSnap = (msg: ChatMessage) => {
     if (!msg.media_url && !msg.content) return;
     const isMine = msg.sender_id === user?.id;
 
@@ -492,7 +579,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
     }
   };
 
-  const sendSignal = async (event: string, payload: Record<string, any>) => {
+  const sendSignal = useCallback(async (event: string, payload: Record<string, unknown>) => {
     const channel = signalingChannelRef.current;
     if (!channel) return;
     await channel.send({
@@ -500,7 +587,11 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
       event,
       payload,
     });
-  };
+  }, []);
+
+  useEffect(() => {
+    sendSignalRef.current = sendSignal;
+  }, [sendSignal]);
 
   const createPeerConnection = (callId: string) => {
     const peer = new RTCPeerConnection({
@@ -586,7 +677,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
     }
   };
 
-  const handleEndCall = (notifyRemote = true) => {
+  const handleEndCall = useCallback((notifyRemote = true) => {
     const callId = currentCallIdRef.current;
     if (notifyRemote && user && callId) {
       sendSignal("call-end", {
@@ -630,7 +721,11 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
     setCallStatus("idle");
     setCallSeconds(0);
     setIsMuted(false);
-  };
+  }, [sendSignal, safeOtherUser.user_id, user]);
+
+  useEffect(() => {
+    handleEndCallRef.current = handleEndCall;
+  }, [handleEndCall]);
 
   const handleRejectIncomingCall = async () => {
     if (!user || !incomingCall) return;
@@ -862,7 +957,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
         mediaRecorderRef.current.stop();
       }
     };
-  }, []);
+  }, [handleEndCall]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -1035,6 +1130,31 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
             {typingUsers.length > 1 ? "People are typing..." : `${safeOtherUser.display_name} is typing...`}
           </p>
         )}
+
+        {isMessageRequestChat && (
+          <div className="mt-2 flex items-center justify-between gap-2 rounded-lg border border-border bg-secondary/40 px-2.5 py-2">
+            <div>
+              <p className="text-[11px] font-semibold text-foreground">Message request</p>
+              <p className="text-[10px] text-muted-foreground">Accept to move this chat into your inbox</p>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => handleMessageRequestAction("delete")}
+                className="rounded-md border border-border px-2 py-1 text-[10px] font-semibold text-muted-foreground"
+              >
+                Delete
+              </button>
+              <button
+                type="button"
+                onClick={() => handleMessageRequestAction("accept")}
+                className="rounded-md bg-primary px-2 py-1 text-[10px] font-semibold text-primary-foreground"
+              >
+                Accept
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       <div ref={scrollRef} className="scrollbar-hide flex-1 overflow-y-auto px-3 py-3">
@@ -1059,12 +1179,15 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
                 );
               }
 
-              const msg = (row as any).message && typeof (row as any).message === "object" ? (row as any).message : {};
+              const msg = row.type === "message" ? row.message : null;
+              if (!msg) return null;
               const msgReply = msg.reply && typeof msg.reply === "object" && !Array.isArray(msg.reply) ? msg.reply : null;
               const msgReactions = Array.isArray(msg.reactions) ? msg.reactions : [];
               const isMine = msg.sender_id === user?.id;
               const isSnap = msg.is_snap;
               const snapViewed = msg.viewed;
+              const isStoryReplyMessage = typeof msg.content === "string" && msg.content.startsWith("Story reply: ");
+              const renderedMessageContent = isStoryReplyMessage ? msg.content?.replace(/^Story reply:\s*/, "") : msg.content;
 
               if (isSnap && snapViewed && !isMine) {
                 return (
@@ -1146,7 +1269,16 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
                               )}
                             </div>
                           )}
-                          {msg.content && <p className="break-words text-[14px] leading-5">{msg.content}</p>}
+                          {isStoryReplyMessage && (
+                            <p
+                              className={`mb-1 text-[11px] font-semibold uppercase tracking-wide ${
+                                isMine ? "text-primary-foreground/80" : "text-muted-foreground"
+                              }`}
+                            >
+                              Replied to your story
+                            </p>
+                          )}
+                          {renderedMessageContent && <p className="break-words text-[14px] leading-5">{renderedMessageContent}</p>}
                         </>
                       )}
                       <div className={`mt-1.5 flex items-center gap-1 text-[10px] ${isMine ? "text-primary-foreground/75" : "text-muted-foreground"}`}>
@@ -1163,7 +1295,7 @@ const ChatView = ({ conversationId, otherUser, onBack }: ChatViewProps) => {
                     {!!msgReactions.length && (
                       <div className={`mt-1 flex flex-wrap gap-1 ${isMine ? "justify-end" : "justify-start"}`}>
                         {Object.entries(
-                          msgReactions.reduce((acc: Record<string, number>, reaction: any) => {
+                          msgReactions.reduce((acc: Record<string, number>, reaction: ChatReaction) => {
                             acc[reaction.emoji] = (acc[reaction.emoji] || 0) + 1;
                             return acc;
                           }, {}),

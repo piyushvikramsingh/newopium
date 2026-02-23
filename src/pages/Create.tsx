@@ -20,11 +20,13 @@ import {
   Volume2,
   VolumeX,
   X,
+  MoreHorizontal,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
+import { useCreateStory } from "@/hooks/useStories";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -73,6 +75,7 @@ const BALANCED_PROFILE: EncodeProfile = {
 type Step = "select" | "edit" | "share" | "success";
 type Audience = "public" | "followers";
 type Visibility = "everyone" | "close_friends" | "age_18_plus";
+type CreateIntent = "post" | "reel";
 
 interface ClipItem {
   id: string;
@@ -133,6 +136,28 @@ const getClipFilterCss = (clip: ClipItem) => {
   const presetCss = getPresetCss(clip.filterStack);
   const adjustmentCss = `brightness(${clip.brightness}%) contrast(${clip.contrast}%) saturate(${clip.saturation}%)`;
   return [presetCss, adjustmentCss].filter(Boolean).join(" ").trim();
+};
+
+const ensureMentionTargetsAllowMentions = async (mentionValues: string[]) => {
+  const mentionUsernames = Array.from(
+    new Set(mentionValues.map((value) => value.replace("@", "").toLowerCase())),
+  );
+
+  if (!mentionUsernames.length) return;
+
+  const { data: mentionProfiles, error } = await supabase
+    .from("profiles")
+    .select("username, allow_mentions")
+    .in("username", mentionUsernames);
+  if (error) throw error;
+
+  const disallowed = (mentionProfiles || [])
+    .filter((profile: any) => profile.allow_mentions === false)
+    .map((profile: any) => `@${profile.username}`);
+
+  if (disallowed.length > 0) {
+    throw new Error(`Mentions are restricted for: ${disallowed.join(", ")}`);
+  }
 };
 
 interface DraftRecord {
@@ -600,6 +625,9 @@ const mergeClipsToSingleFile = async (clips: ClipItem[], music: MusicOverlaySett
 const Create = () => {
   const { user } = useAuth();
   const navigate = useNavigate();
+  const locationState = useLocation().state as { createType?: string } | null;
+  const isStoryCreateMode = locationState?.createType === "story";
+  const createStory = useCreateStory();
 
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
@@ -611,6 +639,7 @@ const Create = () => {
   const cancelRequestedRef = useRef(false);
 
   const [step, setStep] = useState<Step>("select");
+  const [createIntent, setCreateIntent] = useState<CreateIntent>("reel");
   const [clips, setClips] = useState<ClipItem[]>([]);
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
   const [mergeClips, setMergeClips] = useState(false);
@@ -650,6 +679,14 @@ const Create = () => {
   const [cameraFacingMode, setCameraFacingMode] = useState<"user" | "environment">("environment");
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [cameraRecording, setCameraRecording] = useState(false);
+
+  const [storyFile, setStoryFile] = useState<File | null>(null);
+  const [storyPreviewUrl, setStoryPreviewUrl] = useState<string | null>(null);
+  const [storyCaption, setStoryCaption] = useState("");
+  const [storyAudience, setStoryAudience] = useState<"followers" | "close_friends">("followers");
+  const [showCreateOverflow, setShowCreateOverflow] = useState(false);
+  const isSelectStep = step === "select";
+  const createOverflowRef = useRef<HTMLDivElement | null>(null);
 
   const activeClip = useMemo(
     () => clips.find((clip) => clip.id === activeClipId) ?? clips[0] ?? null,
@@ -700,9 +737,85 @@ const Create = () => {
       if (musicFileUrl) {
         URL.revokeObjectURL(musicFileUrl);
       }
+      if (storyPreviewUrl) {
+        URL.revokeObjectURL(storyPreviewUrl);
+      }
     },
-    [cameraStream, musicFileUrl],
+    [cameraStream, musicFileUrl, storyPreviewUrl],
   );
+
+  useEffect(() => {
+    if (!showCreateOverflow) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const targetNode = event.target as Node | null;
+      if (!targetNode) return;
+      if (createOverflowRef.current?.contains(targetNode)) return;
+      setShowCreateOverflow(false);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setShowCreateOverflow(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [showCreateOverflow]);
+
+  const handleStoryFileSelect = (file: File | null) => {
+    if (!file) return;
+    if (!file.type.startsWith("image/") && !file.type.startsWith("video/")) {
+      toast.error("Select an image or video for story");
+      return;
+    }
+
+    if (storyPreviewUrl) URL.revokeObjectURL(storyPreviewUrl);
+    setStoryFile(file);
+    setStoryPreviewUrl(URL.createObjectURL(file));
+  };
+
+  const handleStoryUpload = async () => {
+    if (!user) {
+      toast.error("Sign in to post a story");
+      return;
+    }
+    if (!storyFile) {
+      toast.error("Choose media for your story");
+      return;
+    }
+
+    const isVideo = storyFile.type.startsWith("video/");
+    const extension = storyFile.name.split(".").pop() || (isVideo ? "mp4" : "jpg");
+    const mediaPath = `${user.id}/stories/${Date.now()}.${extension}`;
+
+    try {
+      const { error: uploadError } = await supabase.storage
+        .from("videos")
+        .upload(mediaPath, storyFile, { contentType: storyFile.type || undefined, upsert: true });
+      if (uploadError) throw uploadError;
+
+      const { data: mediaPublic } = supabase.storage.from("videos").getPublicUrl(mediaPath);
+
+      await createStory.mutateAsync({
+        media_url: mediaPublic.publicUrl,
+        media_type: isVideo ? "video" : "image",
+        caption: storyCaption.trim() || undefined,
+        audience: storyAudience,
+      });
+
+      toast.success("Story posted");
+      navigate("/");
+    } catch (error: any) {
+      toast.error(error?.message || "Failed to post story");
+    }
+  };
 
   const scheduleAutoSave = () => {
     if (!clips.length) return;
@@ -907,6 +1020,25 @@ const Create = () => {
     setSuccessCount(0);
     setLastCreatedVideoId(null);
     setStep("select");
+    setShowCreateOverflow(false);
+  };
+
+  const applyCreateIntentPreset = (intent: CreateIntent) => {
+    setCreateIntent(intent);
+
+    if (intent === "post") {
+      setMergeClips(false);
+      setCrossPostReel(false);
+      setCrossPostProfile(true);
+      setCrossPostStory(false);
+      setVisibility("everyone");
+      return;
+    }
+
+    setCrossPostReel(true);
+    setCrossPostProfile(true);
+    setCrossPostStory(false);
+    setVisibility("everyone");
   };
 
   const saveDraft = async (silent = false) => {
@@ -1176,6 +1308,8 @@ const Create = () => {
     };
 
     try {
+      await ensureMentionTargetsAllowMentions(mentionValues);
+
       const encodeProfile = getUploadEncodeProfile();
 
       const targets = mergeClips && clips.length > 1
@@ -1463,48 +1597,169 @@ const Create = () => {
     );
   }
 
-  return (
-    <div className="fade-in min-h-screen bg-background px-4 pb-24 pt-4">
-      <div className="mx-auto w-full max-w-4xl">
-        <div className="mb-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            {step !== "select" && step !== "success" && (
-              <Button variant="ghost" size="icon" onClick={() => setStep("select")}>
-                <ArrowLeft className="h-4 w-4" />
-              </Button>
-            )}
-            <h1 className="text-xl font-bold">Create</h1>
+  if (isStoryCreateMode) {
+    return (
+      <div className="min-h-screen bg-background pb-24">
+        <div className="sticky top-0 z-20 border-b border-border bg-background/95 backdrop-blur">
+          <div className="mx-auto flex max-w-md items-center justify-between px-4 py-3">
+            <button
+              onClick={() => navigate(-1)}
+              className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-1.5 text-sm"
+            >
+              <ArrowLeft className="h-4 w-4" /> Back
+            </button>
+            <h1 className="text-sm font-semibold">Create Story</h1>
+            <div className="w-14" />
           </div>
-          <Button variant="outline" onClick={clearAll}>
-            Reset
-          </Button>
         </div>
 
-        {step !== "success" && (
-          <div className="mb-4 grid grid-cols-3 gap-2 rounded-xl border border-border p-2">
-            <Button
-              variant={step === "select" ? "default" : "ghost"}
+        <div className="mx-auto max-w-md space-y-4 px-4 py-4">
+          <div className="rounded-2xl border border-border p-4">
+            <input
+              type="file"
+              accept="image/*,video/*"
+              onChange={(event) => handleStoryFileSelect(event.target.files?.[0] || null)}
+              className="mb-3 w-full text-sm"
+            />
+
+            {storyPreviewUrl ? (
+              storyFile?.type.startsWith("video/") ? (
+                <video src={storyPreviewUrl} className="max-h-[420px] w-full rounded-xl object-cover" controls playsInline />
+              ) : (
+                <img src={storyPreviewUrl} alt="Story preview" className="max-h-[420px] w-full rounded-xl object-cover" />
+              )
+            ) : (
+              <div className="flex h-60 items-center justify-center rounded-xl border border-dashed border-border text-sm text-muted-foreground">
+                Select media to preview story
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-2xl border border-border p-4">
+            <label className="mb-1 block text-sm font-medium">Caption</label>
+            <Textarea
+              value={storyCaption}
+              onChange={(event) => setStoryCaption(event.target.value)}
+              rows={3}
+              placeholder="Add a caption"
+              className="resize-none"
+              maxLength={160}
+            />
+          </div>
+
+          <div className="rounded-2xl border border-border p-4">
+            <p className="mb-2 text-sm font-medium">Audience</p>
+            <RadioGroup value={storyAudience} onValueChange={(value) => setStoryAudience(value as "followers" | "close_friends") }>
+              <div className="flex items-center gap-2">
+                <RadioGroupItem value="followers" id="story-aud-followers" />
+                <label htmlFor="story-aud-followers" className="text-sm">Everyone who follows you</label>
+              </div>
+              <div className="mt-2 flex items-center gap-2">
+                <RadioGroupItem value="close_friends" id="story-aud-close" />
+                <label htmlFor="story-aud-close" className="text-sm">Close friends only</label>
+              </div>
+            </RadioGroup>
+          </div>
+
+          <Button
+            className="w-full"
+            onClick={() => void handleStoryUpload()}
+            disabled={!storyFile || createStory.isPending}
+          >
+            {createStory.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Share story"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`fade-in min-h-screen bg-background pb-24 ${isSelectStep ? "px-0 pt-0" : "px-4 pt-4"}`}>
+      <div className={`${isSelectStep ? "w-full" : "mx-auto w-full max-w-4xl"}`}>
+        <div className={`mb-4 flex items-center justify-between ${isSelectStep ? "px-4 pt-4" : ""}`}>
+          {isSelectStep ? (
+            <>
+              <div className="w-10" />
+              <h1 className="text-sm font-semibold uppercase tracking-wide text-white/90">New</h1>
+              <div ref={createOverflowRef} className="relative">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="border border-white/20 bg-black/35 text-white hover:bg-black/55"
+                  onClick={() => setShowCreateOverflow((prev) => !prev)}
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+                {showCreateOverflow && (
+                  <div className="absolute right-0 z-30 mt-2 w-36 overflow-hidden rounded-xl border border-border bg-background/95 p-1 backdrop-blur">
+                    <button
+                      onClick={() => {
+                        clearAll();
+                      }}
+                      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs font-semibold text-foreground hover:bg-secondary"
+                    >
+                      Reset draft
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowCreateOverflow(false);
+                        navigate("/create", { state: { createType: "story" } });
+                      }}
+                      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs font-semibold text-foreground hover:bg-secondary"
+                    >
+                      Story mode
+                    </button>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-2">
+                {step !== "select" && step !== "success" && (
+                  <Button variant="ghost" size="icon" onClick={() => setStep("select")}>
+                    <ArrowLeft className="h-4 w-4" />
+                  </Button>
+                )}
+                <h1 className="text-xl font-bold">
+                  {step === "edit" ? "Edit" : step === "share" ? "Share" : "Done"}
+                </h1>
+              </div>
+              <Button variant="outline" onClick={clearAll}>
+                Reset
+              </Button>
+            </>
+          )}
+        </div>
+
+        {!isSelectStep && step !== "success" && (
+          <div className="mb-4 flex items-center justify-center gap-8 border-b border-border/70 pb-2 text-xs font-semibold uppercase tracking-wide">
+            <button
               onClick={() => setStep("select")}
-              className="w-full"
+              className={`pb-2 transition-colors ${
+                step === "select" ? "border-b-2 border-foreground text-foreground" : "text-muted-foreground"
+              }`}
             >
               Select
-            </Button>
-            <Button
-              variant={step === "edit" ? "default" : "ghost"}
+            </button>
+            <button
               onClick={() => clips.length && setStep("edit")}
-              className="w-full"
               disabled={!clips.length}
+              className={`pb-2 transition-colors disabled:opacity-40 ${
+                step === "edit" ? "border-b-2 border-foreground text-foreground" : "text-muted-foreground"
+              }`}
             >
               Edit
-            </Button>
-            <Button
-              variant={step === "share" ? "default" : "ghost"}
+            </button>
+            <button
               onClick={() => clips.length && setStep("share")}
-              className="w-full"
               disabled={!clips.length}
+              className={`pb-2 transition-colors disabled:opacity-40 ${
+                step === "share" ? "border-b-2 border-foreground text-foreground" : "text-muted-foreground"
+              }`}
             >
               Share
-            </Button>
+            </button>
           </div>
         )}
 
@@ -1541,43 +1796,129 @@ const Create = () => {
         />
 
         {step === "select" && (
-          <div className="grid gap-4 md:grid-cols-[1.2fr_1fr]">
-            <div className="rounded-2xl border border-border p-4">
-              <h2 className="mb-3 text-sm font-semibold text-muted-foreground">Source picker</h2>
-              <div className="grid gap-3 sm:grid-cols-3">
-                <Button
-                  variant="outline"
-                  className="h-24 flex-col gap-2"
-                  onClick={() => void startCamera("environment")}
-                >
-                  <Camera className="h-5 w-5" />
-                  Camera
-                </Button>
-                <Button
-                  variant="outline"
-                  className="h-24 flex-col gap-2"
-                  onClick={() => galleryInputRef.current?.click()}
-                >
-                  <Image className="h-5 w-5" />
-                  Gallery
-                </Button>
-                <Button
-                  variant="outline"
-                  className="h-24 flex-col gap-2"
-                  onClick={() => setStep("share")}
-                  disabled={!drafts.length}
-                >
-                  <Save className="h-5 w-5" />
-                  Drafts
-                </Button>
+          <div className="grid gap-4">
+            <div className="relative min-h-[calc(100dvh-210px)] overflow-hidden bg-black md:mx-auto md:w-full md:max-w-md md:rounded-2xl md:border md:border-border">
+              {clips[0] ? (
+                <video
+                  src={clips[0].url}
+                  muted
+                  playsInline
+                  loop
+                  autoPlay
+                  className="h-full w-full object-cover"
+                />
+              ) : (
+                <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-white/80">
+                  <Camera className="h-10 w-10" />
+                  <p className="text-sm font-medium">Camera preview</p>
+                  <p className="px-6 text-center text-xs text-white/60">Record a clip or upload from gallery to start creating.</p>
+                </div>
+              )}
+
+              <div className="pointer-events-none absolute inset-x-0 top-0 bg-gradient-to-b from-black/70 to-transparent px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-white/90">Instagram-style create flow</p>
               </div>
 
-              <div className="mt-4 rounded-lg bg-secondary/40 p-3 text-xs text-muted-foreground">
-                <p>Supports multi-clip upload/merge, draft restore, schedule setup, and full share controls.</p>
+              <div className="absolute inset-x-0 top-0 z-10 px-4 pt-10">
+                <div className="rounded-xl border border-white/20 bg-black/35 p-2 backdrop-blur">
+                  <div className="grid grid-cols-3 gap-2">
+                    <Button
+                      type="button"
+                      variant={createIntent === "post" ? "default" : "outline"}
+                      className="h-12 flex-col gap-1 border-white/25 bg-black/40 text-white hover:bg-black/60"
+                      onClick={() => applyCreateIntentPreset("post")}
+                    >
+                      <Image className="h-4 w-4" />
+                      Post
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={createIntent === "reel" ? "default" : "outline"}
+                      className="h-12 flex-col gap-1 border-white/25 bg-black/40 text-white hover:bg-black/60"
+                      onClick={() => applyCreateIntentPreset("reel")}
+                    >
+                      <Film className="h-4 w-4" />
+                      Reel
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-12 flex-col gap-1 border-white/25 bg-black/40 text-white hover:bg-black/60"
+                      onClick={() => navigate("/create", { state: { createType: "story" } })}
+                    >
+                      <Camera className="h-4 w-4" />
+                      Story
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-black/85 via-black/50 to-transparent px-4 pb-5 pt-16">
+                <div className="mb-3 rounded-lg border border-white/20 bg-black/35 p-2 text-[11px] text-white/80 backdrop-blur">
+                  {createIntent === "post"
+                    ? "Post mode prioritizes profile feed publishing defaults."
+                    : "Reel mode keeps vertical-first and reel cross-post defaults."}
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <Button
+                    variant="outline"
+                    className="h-16 flex-col gap-1 border-white/30 bg-black/35 text-white hover:bg-black/55"
+                    onClick={() => void startCamera("environment")}
+                  >
+                    <Camera className="h-5 w-5" />
+                    Record
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-16 flex-col gap-1 border-white/30 bg-black/35 text-white hover:bg-black/55"
+                    onClick={() => galleryInputRef.current?.click()}
+                  >
+                    <Image className="h-5 w-5" />
+                    Upload
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-16 flex-col gap-1 border-white/30 bg-black/35 text-white hover:bg-black/55"
+                    onClick={() => setStep("share")}
+                    disabled={!drafts.length}
+                  >
+                    <Save className="h-5 w-5" />
+                    Drafts
+                  </Button>
+                </div>
+
+                {clips.length > 0 && (
+                  <div className="mt-3 rounded-lg border border-white/20 bg-black/35 p-2 backdrop-blur">
+                    <div className="mb-2 flex items-center justify-between">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-white/80">Continue editing</p>
+                      <Button size="sm" variant="secondary" onClick={() => setStep("edit")}>Resume</Button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {clips.slice(0, 4).map((clip) => (
+                        <button
+                          key={clip.id}
+                          className="rounded-full border border-white/25 px-2.5 py-1 text-xs text-white"
+                          onClick={() => {
+                            setActiveClipId(clip.id);
+                            setStep("edit");
+                          }}
+                        >
+                          {clip.file.name.length > 14 ? `${clip.file.name.slice(0, 14)}…` : clip.file.name}
+                        </button>
+                      ))}
+                      {clips.length > 4 && (
+                        <span className="rounded-full border border-white/25 px-2.5 py-1 text-xs text-white/75">
+                          +{clips.length - 4} more
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 
-            <div className="rounded-2xl border border-border p-4">
+            <div className="mx-4 rounded-2xl border border-border p-4 md:mx-auto md:w-full md:max-w-md">
               <div className="mb-2 flex items-center justify-between">
                 <h2 className="text-sm font-semibold text-muted-foreground">Drafts</h2>
                 <span className="text-xs text-muted-foreground">{drafts.length}</span>

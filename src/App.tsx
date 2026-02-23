@@ -7,11 +7,20 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "@/hooks/useAuth";
 import AppLayout from "@/layouts/AppLayout";
 
+const HomeTan = lazy(() => import("./pages/HomeTan"));
 const Index = lazy(() => import("./pages/Index"));
 const Discover = lazy(() => import("./pages/Discover"));
 const Create = lazy(() => import("./pages/Create"));
 const Inbox = lazy(() => import("./pages/Inbox"));
 const Profile = lazy(() => import("./pages/Profile"));
+const Settings = lazy(() => import("./pages/Settings"));
+const AdminPortal = lazy(() => import("./pages/AdminPortal"));
+const Analytics = lazy(() => import("./pages/Analytics"));
+const Drafts = lazy(() => import("./pages/Drafts"));
+const SearchPage = lazy(() => import("./pages/Search"));
+const Engagement = lazy(() => import("./pages/Engagement"));
+const LiveStreaming = lazy(() => import("./pages/LiveStreaming"));
+const Monetization = lazy(() => import("./pages/Monetization"));
 const Auth = lazy(() => import("./pages/Auth"));
 const NotFound = lazy(() => import("./pages/NotFound"));
 
@@ -31,10 +40,19 @@ const queryClient = new QueryClient({
 const RouteWarmup = () => {
   useEffect(() => {
     const warm = () => {
+      void import("./pages/HomeTan");
       void import("./pages/Discover");
       void import("./pages/Create");
       void import("./pages/Inbox");
       void import("./pages/Profile");
+      void import("./pages/Settings");
+      void import("./pages/AdminPortal");
+      void import("./pages/Analytics");
+      void import("./pages/Drafts");
+      void import("./pages/Search");
+      void import("./pages/Engagement");
+      void import("./pages/LiveStreaming");
+      void import("./pages/Monetization");
     };
 
     const withIdle = window as Window & {
@@ -94,10 +112,10 @@ class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryStat
               Check browser console (F12) and ensure Supabase environment variables are set.
             </p>
             <button
-              onClick={() => window.location.reload()}
+              onClick={() => this.setState({ hasError: false, error: null })}
               className="rounded bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90"
             >
-              Reload App
+              Try again
             </button>
           </div>
         </div>
@@ -121,12 +139,21 @@ const App = () => (
               <Routes>
                 <Route path="/auth" element={<Auth />} />
                 <Route element={<AppLayout />}>
-                  <Route path="/" element={<Index />} />
+                  <Route path="/" element={<HomeTan />} />
+                  <Route path="/clipy" element={<Index />} />
                   <Route path="/discover" element={<Discover />} />
                   <Route path="/create" element={<Create />} />
                   <Route path="/inbox" element={<Inbox />} />
                   <Route path="/profile" element={<Profile />} />
                   <Route path="/profile/:userId" element={<Profile />} />
+                  <Route path="/settings" element={<Settings />} />
+                  <Route path="/admin" element={<AdminPortal />} />
+                  <Route path="/analytics" element={<Analytics />} />
+                  <Route path="/drafts" element={<Drafts />} />
+                  <Route path="/search" element={<SearchPage />} />
+                  <Route path="/engagement" element={<Engagement />} />
+                  <Route path="/live" element={<LiveStreaming />} />
+                  <Route path="/monetization" element={<Monetization />} />
                 </Route>
                 <Route path="*" element={<NotFound />} />
               </Routes>

@@ -3,7 +3,6 @@ import {
   Grid3X3,
   Bookmark,
   Heart,
-  LogOut,
   Camera,
   X,
   Loader2,
@@ -23,6 +22,15 @@ import {
   EyeOff,
   BarChart3,
   UserPlus,
+  SlidersHorizontal,
+  MessageCircle,
+  Share2,
+  Download,
+  Trash2,
+  List,
+  LayoutGrid,
+  Clock,
+  MoreHorizontal,
 } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { useAuth } from "@/hooks/useAuth";
@@ -54,6 +62,7 @@ import {
   useCreateReferral,
   useReferrals,
   useHiddenVideos,
+  useHideVideo,
   useUnhideVideo,
 } from "@/hooks/useData";
 import { useNavigate, useParams } from "react-router-dom";
@@ -63,9 +72,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useCreateConversation } from "@/hooks/useMessages";
+import { useQueryClient } from "@tanstack/react-query";
 
 const Profile = () => {
-  const { user, signOut } = useAuth();
+  const { user } = useAuth();
   const navigate = useNavigate();
   const { userId: paramUserId } = useParams<{ userId: string }>();
 
@@ -75,6 +85,19 @@ const Profile = () => {
   const [showFollowingModal, setShowFollowingModal] = useState(false);
   const [showHiddenVideosModal, setShowHiddenVideosModal] = useState(false);
   const [newHighlightTitle, setNewHighlightTitle] = useState("");
+  const [gridLayout, setGridLayout] = useState<"grid-3" | "grid-2" | "list">("grid-3");
+  const [sortBy, setSortBy] = useState<"recent" | "popular" | "pinned">("recent");
+  const [showFilters, setShowFilters] = useState(false);
+  const [tabSearch, setTabSearch] = useState("");
+  const [pinnedOnly, setPinnedOnly] = useState(false);
+  const [longPressVideoId, setLongPressVideoId] = useState<string | null>(null);
+  const [hoveredVideoId, setHoveredVideoId] = useState<string | null>(null);
+  const [pullStartY, setPullStartY] = useState(0);
+  const [pullDistance, setPullDistance] = useState(0);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [excludedVideoIds, setExcludedVideoIds] = useState<Set<string>>(() => new Set());
+  const containerRef = useRef<HTMLDivElement>(null);
+  const queryClient = useQueryClient();
 
   const viewingUserId = paramUserId || user?.id;
   const isOwnProfile = !paramUserId || paramUserId === user?.id;
@@ -108,39 +131,133 @@ const Profile = () => {
   const updateProfile = useUpdateProfile();
   const togglePinVideo = useTogglePinVideo();
   const createReferral = useCreateReferral();
+  const hideVideo = useHideVideo();
   const unhideVideo = useUnhideVideo();
-
-  if (!viewingUserId) {
-    return (
-      <div className="flex min-h-screen flex-col items-center justify-center bg-background pb-20 gap-4">
-        <p className="text-muted-foreground">Sign in to see your profile</p>
-        <button
-          onClick={() => navigate("/auth")}
-          className="rounded-xl bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground"
-        >
-          Sign In
-        </button>
-      </div>
-    );
-  }
 
   const hasPendingRequest = followRequest?.status === "pending";
   const canViewPrivateContent = isOwnProfile || !profile?.is_private || !!isFollowing;
 
-  const tabs = [
-    { id: "posts" as const, icon: Grid3X3, label: "Posts" },
-    { id: "reels" as const, icon: Play, label: "Reels" },
-    { id: "tagged" as const, icon: UserRound, label: "Tagged" },
-    ...(isOwnProfile ? [{ id: "saved" as const, icon: Bookmark, label: "Saved" }] : []),
-  ];
+  const tabCounts = useMemo(
+    () => ({
+      posts: videos?.length ?? 0,
+      reels: videos?.length ?? 0,
+      tagged: taggedVideos?.length ?? 0,
+      saved: bookmarkedVideos?.length ?? 0,
+    }),
+    [videos, taggedVideos, bookmarkedVideos],
+  );
+
+  const tabs = useMemo(
+    () => [
+      { id: "posts" as const, icon: Grid3X3, label: "Posts", count: tabCounts.posts },
+      { id: "reels" as const, icon: Play, label: "Reels", count: tabCounts.reels },
+      { id: "tagged" as const, icon: UserRound, label: "Tagged", count: tabCounts.tagged },
+      ...(isOwnProfile ? [{ id: "saved" as const, icon: Bookmark, label: "Saved", count: tabCounts.saved }] : []),
+    ],
+    [isOwnProfile, tabCounts],
+  );
 
   const currentVideos = useMemo(() => {
     if (!canViewPrivateContent) return [];
-    if (activeTab === "posts") return videos || [];
-    if (activeTab === "reels") return videos || [];
-    if (activeTab === "tagged") return taggedVideos || [];
-    return bookmarkedVideos || [];
-  }, [activeTab, videos, taggedVideos, bookmarkedVideos, canViewPrivateContent]);
+    let result: any[] = [];
+    
+    if (activeTab === "posts" || activeTab === "reels") {
+      result = [...(videos || [])];
+    } else if (activeTab === "tagged") {
+      result = [...(taggedVideos || [])];
+    } else {
+      result = [...(bookmarkedVideos || [])];
+    }
+
+    // Apply sorting
+    if (sortBy === "pinned" && (activeTab === "posts" || activeTab === "reels")) {
+      result.sort((a: any, b: any) => Number(!!b.is_pinned) - Number(!!a.is_pinned));
+    } else if (sortBy === "popular") {
+      result.sort((a: any, b: any) => (b.likes_count || 0) - (a.likes_count || 0));
+    } else {
+      result.sort((a: any, b: any) => {
+        const dateA = new Date(a.created_at || 0).getTime();
+        const dateB = new Date(b.created_at || 0).getTime();
+        return dateB - dateA;
+      });
+    }
+
+    if (pinnedOnly && (activeTab === "posts" || activeTab === "reels")) {
+      result = result.filter((video: any) => !!video.is_pinned);
+    }
+
+    const query = tabSearch.trim().toLowerCase();
+    if (query) {
+      result = result.filter((video: any) => {
+        const description = String(video.description || "").toLowerCase();
+        const music = String(video.music || "").toLowerCase();
+        const hashtags = Array.isArray(video.hashtags) ? video.hashtags.join(" ").toLowerCase() : "";
+        return description.includes(query) || music.includes(query) || hashtags.includes(query);
+      });
+    }
+
+    if (excludedVideoIds.size > 0) {
+      result = result.filter((video: any) => !excludedVideoIds.has(video.id));
+    }
+
+    return result;
+  }, [activeTab, videos, taggedVideos, bookmarkedVideos, canViewPrivateContent, sortBy, pinnedOnly, tabSearch, excludedVideoIds]);
+
+  const activeTabMeta = tabs.find((tab) => tab.id === activeTab);
+
+  const handlePullRefresh = async () => {
+    if (isRefreshing) return;
+    setIsRefreshing(true);
+    try {
+      const targets = [
+        ["profile", viewingUserId],
+        ["follow-counts", viewingUserId],
+        ["user-videos", viewingUserId],
+        ["tagged-videos", viewingUserId],
+        ["profile-highlights", viewingUserId],
+        ["profile-links", viewingUserId],
+        ["creator-metrics", viewingUserId],
+        ["hidden-videos", user?.id, 100],
+      ];
+
+      if (isOwnProfile) {
+        targets.push(["liked-videos", user?.id], ["bookmarked-videos", user?.id], ["referrals", user?.id]);
+      }
+
+      await Promise.all(
+        targets.map((queryKey) => queryClient.invalidateQueries({ queryKey })),
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      toast.success("Profile refreshed");
+    } finally {
+      setIsRefreshing(false);
+      setPullDistance(0);
+    }
+  };
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (containerRef.current && containerRef.current.scrollTop === 0) {
+      setPullStartY(e.touches[0].clientY);
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (pullStartY > 0 && containerRef.current && containerRef.current.scrollTop === 0) {
+      const currentY = e.touches[0].clientY;
+      const distance = Math.max(0, Math.min(currentY - pullStartY, 80));
+      setPullDistance(distance);
+    }
+  };
+
+  const handleTouchEnd = () => {
+    if (pullDistance > 60) {
+      handlePullRefresh();
+    } else {
+      setPullDistance(0);
+    }
+    setPullStartY(0);
+  };
 
   const pinnedVideoIds = useMemo(
     () => new Set((videos || []).filter((video: any) => video.is_pinned).map((video: any) => video.id)),
@@ -159,11 +276,6 @@ const Profile = () => {
     const days = Math.floor(hours / 24);
     return `Active ${days}d ago`;
   }, [profile]);
-
-  const handleSignOut = async () => {
-    await signOut();
-    navigate("/");
-  };
 
   const handleFollow = async () => {
     if (!user) {
@@ -243,8 +355,79 @@ const Profile = () => {
     following: counts?.following ?? 0,
   };
 
+  const professionalDashboard = useMemo(() => {
+    if (!creatorMetrics) return null;
+
+    const views = creatorMetrics.totalViews ?? 0;
+    const reach = creatorMetrics.reach ?? 0;
+    const posts = creatorMetrics.posts ?? 0;
+    const engagement = creatorMetrics.engagement ?? 0;
+    const likes = creatorMetrics.likes ?? 0;
+    const comments = creatorMetrics.comments ?? 0;
+    const shares = creatorMetrics.shares ?? 0;
+    const avgWatch = Math.max(0, Math.min(100, creatorMetrics.avgWatchPercent ?? 0));
+    const completion = Math.max(0, Math.min(100, creatorMetrics.completionRate ?? 0));
+    const followerGrowth = creatorMetrics.followerGrowth7d ?? 0;
+    const followersTotal = counts?.followers ?? 0;
+    const invites = (referrals || []).length;
+    const topContent = creatorMetrics.topVideos || [];
+
+    const consistencyScore = Math.round((avgWatch * 0.45) + (completion * 0.45) + (Math.min(engagement, 100) * 0.1));
+    const momentum = followerGrowth >= 0 ? `+${followerGrowth}` : String(followerGrowth);
+    const engagementRate = posts > 0 ? Math.round(engagement / posts) : 0;
+
+    return {
+      views,
+      reach,
+      posts,
+      engagement,
+      likes,
+      comments,
+      shares,
+      avgWatch,
+      completion,
+      followerGrowth,
+      followersTotal,
+      invites,
+      consistencyScore,
+      momentum,
+      engagementRate,
+      topContent,
+    };
+  }, [creatorMetrics, referrals, counts?.followers]);
+
+  if (!viewingUserId) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center bg-background pb-20 gap-4">
+        <p className="text-muted-foreground">Sign in to see your profile</p>
+        <button
+          onClick={() => navigate("/auth")}
+          className="rounded-xl bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground"
+        >
+          Sign In
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div className="fade-in min-h-screen bg-background pb-20">
+    <div 
+      ref={containerRef}
+      className="fade-in min-h-screen bg-background pb-20 overflow-y-auto"
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+    >
+      {pullDistance > 0 && (
+        <div 
+          className="flex items-center justify-center py-2 transition-all"
+          style={{ height: `${pullDistance}px` }}
+        >
+          <div className={`transition-transform ${pullDistance > 60 ? 'scale-100' : 'scale-75'}`}>
+            <Loader2 className={`h-5 w-5 text-primary ${isRefreshing ? 'animate-spin' : ''}`} />
+          </div>
+        </div>
+      )}
       <div className="flex items-center justify-between px-4 pt-4">
         <div className="flex items-center gap-3 min-w-0">
           {!isOwnProfile && (
@@ -256,8 +439,8 @@ const Profile = () => {
           {profile?.is_verified && <BadgeCheck className="h-4 w-4 text-primary" />}
         </div>
         {isOwnProfile ? (
-          <button onClick={handleSignOut} className="lift-on-tap rounded-lg bg-secondary p-2">
-            <LogOut className="h-4 w-4 text-foreground" />
+          <button onClick={() => navigate("/settings")} className="lift-on-tap rounded-lg bg-secondary p-2">
+            <Settings className="h-4 w-4 text-foreground" />
           </button>
         ) : (
           <button onClick={() => navigate("/discover")} className="lift-on-tap rounded-lg bg-secondary p-2">
@@ -336,10 +519,11 @@ const Profile = () => {
               </button>
               <button
                 onClick={async () => {
+                  if (createReferral.isPending) return;
                   try {
                     const referral = await createReferral.mutateAsync();
                     if (!referral?.code) {
-                      toast.message("Invites will be available after database update");
+                      toast.error("Invites are unavailable right now");
                       return;
                     }
                     const link = `${window.location.origin}/auth?ref=${referral?.code}`;
@@ -349,9 +533,10 @@ const Profile = () => {
                     toast.error("Could not create invite");
                   }
                 }}
+                disabled={createReferral.isPending}
                 className="lift-on-tap rounded-lg bg-secondary px-4 py-2 text-sm font-semibold text-secondary-foreground"
               >
-                Invite
+                {createReferral.isPending ? "Creating..." : "Invite"}
               </button>
               <button
                 onClick={() => setShowHiddenVideosModal(true)}
@@ -384,7 +569,7 @@ const Profile = () => {
         </div>
 
         {isOwnProfile && !!incomingFollowRequests?.length && (
-          <div className="mt-4 rounded-xl border border-border p-3">
+          <div className="mt-4 rounded-xl panel-surface p-3">
             <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Follow Requests</p>
             <div className="mt-2 space-y-2">
               {incomingFollowRequests.slice(0, 3).map((request: any) => (
@@ -429,7 +614,7 @@ const Profile = () => {
             {(highlights || []).map((highlight: any) => (
               <div key={highlight.id} className="shrink-0 text-center">
                 <button
-                  onClick={() => toast.message(`${highlight.title} highlight opened`) }
+                  onClick={() => navigate("/clipy")}
                   className="h-16 w-16 overflow-hidden rounded-full border border-border bg-secondary"
                 >
                   {highlight.cover_url ? (
@@ -451,46 +636,121 @@ const Profile = () => {
           </div>
         </div>
 
-        {(profile?.professional_account || isOwnProfile) && !!creatorMetrics && (
-          <div className="mt-5 rounded-xl border border-border p-3">
-            <div className="mb-2 flex items-center gap-2">
-              <BarChart3 className="h-4 w-4 text-primary" />
-              <p className="text-sm font-semibold text-foreground">Professional Dashboard</p>
+        {(profile?.professional_account || isOwnProfile) && !!professionalDashboard && (
+          <div className="mt-5 rounded-xl panel-surface p-4">
+            <div className="flex items-center justify-between gap-2">
+              <div className="inline-flex items-center gap-2">
+                <BarChart3 className="h-4 w-4 text-primary" />
+                <p className="text-sm font-semibold text-foreground">Professional Dashboard</p>
+              </div>
+              <button
+                onClick={() => navigate("/analytics")}
+                className="rounded-full bg-secondary px-2 py-0.5 text-[10px] font-semibold text-muted-foreground hover:text-foreground"
+              >
+                See insights
+              </button>
             </div>
-            <div className="grid grid-cols-3 gap-2 text-center">
-              <div className="rounded-lg bg-secondary/50 p-2">
-                <Eye className="mx-auto mb-1 h-4 w-4 text-muted-foreground" />
-                <p className="text-sm font-bold text-foreground">{creatorMetrics.totalViews ?? creatorMetrics.reach}</p>
-                <p className="text-[10px] text-muted-foreground">Views</p>
+
+            <div className="mt-3 grid grid-cols-3 gap-2">
+              <div className="rounded-lg bg-secondary/45 p-3">
+                <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Accounts reached</p>
+                <p className="mt-1 text-sm font-bold text-foreground">{professionalDashboard.reach.toLocaleString()}</p>
+                <p className="mt-1 text-[10px] text-muted-foreground">From {professionalDashboard.posts} posts</p>
               </div>
-              <div className="rounded-lg bg-secondary/50 p-2">
-                <TrendingUp className="mx-auto mb-1 h-4 w-4 text-muted-foreground" />
-                <p className="text-sm font-bold text-foreground">{creatorMetrics.engagement}</p>
-                <p className="text-[10px] text-muted-foreground">Engagement</p>
+              <div className="rounded-lg bg-secondary/45 p-3">
+                <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Accounts engaged</p>
+                <p className="mt-1 text-sm font-bold text-foreground">{professionalDashboard.engagement.toLocaleString()}</p>
+                <p className="mt-1 text-[10px] text-muted-foreground">Avg {professionalDashboard.engagementRate} per post</p>
               </div>
-              <div className="rounded-lg bg-secondary/50 p-2">
-                <Play className="mx-auto mb-1 h-4 w-4 text-muted-foreground" />
-                <p className="text-sm font-bold text-foreground">{creatorMetrics.posts}</p>
-                <p className="text-[10px] text-muted-foreground">Posts</p>
-              </div>
-              <div className="rounded-lg bg-secondary/50 p-2">
-                <p className="text-sm font-bold text-foreground">{creatorMetrics.avgWatchPercent ?? 0}%</p>
-                <p className="text-[10px] text-muted-foreground">Avg watch</p>
-              </div>
-              <div className="rounded-lg bg-secondary/50 p-2">
-                <p className="text-sm font-bold text-foreground">{creatorMetrics.completionRate ?? 0}%</p>
-                <p className="text-[10px] text-muted-foreground">Completion</p>
-              </div>
-              <div className="rounded-lg bg-secondary/50 p-2">
-                <p className="text-sm font-bold text-foreground">+{creatorMetrics.followerGrowth7d ?? 0}</p>
-                <p className="text-[10px] text-muted-foreground">Followers 7d</p>
+              <div className="rounded-lg bg-secondary/45 p-3">
+                <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Total followers</p>
+                <p className="mt-1 text-sm font-bold text-foreground">{professionalDashboard.followersTotal.toLocaleString()}</p>
+                <p className={`mt-1 text-[10px] font-semibold ${professionalDashboard.followerGrowth >= 0 ? "text-primary" : "text-destructive"}`}>
+                  {professionalDashboard.momentum} in last 7d
+                </p>
               </div>
             </div>
 
-            {!!(referrals || []).length && (
-              <p className="mt-2 text-[11px] text-muted-foreground">
-                Invites sent: {(referrals || []).length}
-              </p>
+            <div className="mt-3 space-y-2 rounded-lg bg-secondary/35 p-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Average watch</span>
+                <span className="font-semibold text-foreground">{professionalDashboard.avgWatch}%</span>
+              </div>
+              <div className="h-1.5 rounded-full bg-secondary">
+                <div className="h-1.5 rounded-full bg-primary" style={{ width: `${professionalDashboard.avgWatch}%` }} />
+              </div>
+
+              <div className="mt-2 flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Completion</span>
+                <span className="font-semibold text-foreground">{professionalDashboard.completion}%</span>
+              </div>
+              <div className="h-1.5 rounded-full bg-secondary">
+                <div className="h-1.5 rounded-full bg-foreground/80" style={{ width: `${professionalDashboard.completion}%` }} />
+              </div>
+            </div>
+
+            <div className="mt-3 grid grid-cols-2 gap-2 text-center">
+              <div className="rounded-lg bg-secondary/45 p-2">
+                <p className="text-xs font-bold text-foreground">{professionalDashboard.consistencyScore}/100</p>
+                <p className="text-[10px] text-muted-foreground">Content quality score</p>
+              </div>
+              <div className="rounded-lg bg-secondary/45 p-2">
+                <p className="text-xs font-bold text-foreground">{professionalDashboard.invites}</p>
+                <p className="text-[10px] text-muted-foreground">Invites sent</p>
+              </div>
+            </div>
+
+            <div className="mt-3 rounded-lg bg-secondary/35 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Content interactions</p>
+                <p className="text-[10px] text-muted-foreground">Last 7 days</p>
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div className="rounded-md bg-secondary/50 p-2">
+                  <p className="text-xs font-bold text-foreground">{professionalDashboard.likes.toLocaleString()}</p>
+                  <p className="text-[10px] text-muted-foreground">Likes</p>
+                </div>
+                <div className="rounded-md bg-secondary/50 p-2">
+                  <p className="text-xs font-bold text-foreground">{professionalDashboard.comments.toLocaleString()}</p>
+                  <p className="text-[10px] text-muted-foreground">Comments</p>
+                </div>
+                <div className="rounded-md bg-secondary/50 p-2">
+                  <p className="text-xs font-bold text-foreground">{professionalDashboard.shares.toLocaleString()}</p>
+                  <p className="text-[10px] text-muted-foreground">Shares</p>
+                </div>
+              </div>
+            </div>
+
+            {!!professionalDashboard.topContent.length && (
+              <div className="mt-3 rounded-lg bg-secondary/35 p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Top content</p>
+                  <button
+                    onClick={() => navigate("/clipy")}
+                    className="text-[10px] font-semibold text-primary"
+                  >
+                    View all
+                  </button>
+                </div>
+                <div className="scrollbar-hide flex gap-2 overflow-x-auto pb-1">
+                  {professionalDashboard.topContent.slice(0, 4).map((item: any) => (
+                    <button
+                      key={item.id}
+                      onClick={() => navigate("/clipy", { state: { focusVideoId: item.id, focusSource: "profile-dashboard" } })}
+                      className="relative h-20 w-14 shrink-0 overflow-hidden rounded-md bg-secondary"
+                    >
+                      {item.thumbnail_url ? (
+                        <img src={item.thumbnail_url} alt="" className="h-full w-full object-cover" />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center text-[10px] text-muted-foreground">No cover</div>
+                      )}
+                      <div className="absolute inset-x-0 bottom-0 bg-black/60 px-1 py-0.5 text-[9px] font-semibold text-white">
+                        {item.score || 0}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
             )}
           </div>
         )}
@@ -548,18 +808,26 @@ const Profile = () => {
         )}
       </div>
 
-      <div className="mt-4 flex border-b border-border">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
-            className={`flex-1 flex justify-center py-3 transition-colors ${
-              activeTab === tab.id ? "border-b-2 border-foreground text-foreground" : "text-muted-foreground"
-            }`}
-          >
-            <tab.icon className="h-5 w-5" />
-          </button>
-        ))}
+      <div className="mt-4 border-y border-border bg-background/95 px-2 py-2">
+        <div className="scrollbar-hide flex gap-2 overflow-x-auto">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 transition-colors ${
+                activeTab === tab.id
+                  ? "border-foreground bg-foreground text-background"
+                  : "border-border bg-secondary/40 text-foreground"
+              }`}
+            >
+              <tab.icon className="h-3.5 w-3.5" />
+              <span className="text-xs font-semibold">{tab.label}</span>
+              <span className={`rounded-full px-1.5 py-0.5 text-[10px] ${activeTab === tab.id ? "bg-background/20 text-background" : "bg-secondary text-muted-foreground"}`}>
+                {tab.count}
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
 
       {!canViewPrivateContent ? (
@@ -569,57 +837,249 @@ const Profile = () => {
           <p className="mt-1 text-xs">Follow this user to see their content</p>
         </div>
       ) : (
-        <div className="grid grid-cols-3 gap-0.5 p-0.5">
-          {currentVideos.map((video: any) => (
-            <div key={video.id} className="relative aspect-[9/16] overflow-hidden bg-secondary">
-              {video.thumbnail_url ? (
-                <img src={video.thumbnail_url} alt="" className="h-full w-full object-cover" loading="lazy" />
-              ) : video.video_url ? (
-                <video src={video.video_url} className="h-full w-full object-cover" muted preload="metadata" />
-              ) : (
-                <div className="flex h-full items-center justify-center">
-                  <Play className="h-6 w-6 text-muted-foreground" />
-                </div>
-              )}
-              {pinnedVideoIds.has(video.id) && (
-                <div className="absolute right-1 top-1 rounded-full bg-black/60 p-1">
-                  <Pin className="h-3 w-3 text-white" />
-                </div>
-              )}
-              {isOwnProfile && (activeTab === "posts" || activeTab === "reels") && (
+        <div>
+          <div className="px-2 pt-2">
+            <Input
+              value={tabSearch}
+              onChange={(event) => setTabSearch(event.target.value)}
+              placeholder={`Search in ${activeTabMeta?.label?.toLowerCase() || "posts"}`}
+              className="h-8 text-xs"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-2 px-2 pb-2 pt-3">
+            <div className="flex items-center gap-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-foreground">{activeTabMeta?.label || "Posts"}</p>
+              <span className="rounded-full bg-secondary px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">{currentVideos.length}</span>
+              {tabSearch.trim() && (
                 <button
-                  type="button"
-                  onClick={async () => {
-                    try {
-                      await togglePinVideo.mutateAsync({ videoId: video.id, isPinned: !!video.is_pinned });
-                      toast.success(video.is_pinned ? "Post unpinned" : "Post pinned");
-                    } catch (error: any) {
-                      toast.error(error.message || "Unable to change pin status");
-                    }
-                  }}
-                  className="absolute left-1 top-1 rounded-full bg-black/60 p-1"
-                  title={video.is_pinned ? "Unpin post" : "Pin post"}
+                  onClick={() => setTabSearch("")}
+                  className="rounded-full bg-secondary px-2 py-0.5 text-[10px] font-semibold text-muted-foreground"
                 >
-                  <Pin className="h-3 w-3 text-white" />
+                  Clear search
                 </button>
               )}
-              <div className="absolute bottom-1 left-1 flex items-center gap-1">
-                <Play className="h-3 w-3 text-white" fill="white" />
-                <span className="text-[10px] font-medium text-white">{video.likes_count || 0}</span>
-              </div>
             </div>
-          ))}
-          {currentVideos.length === 0 && (
-            <div className="col-span-3 py-16 text-center text-sm text-muted-foreground">
-              {activeTab === "posts"
-                ? "No posts yet"
-                : activeTab === "reels"
-                ? "No reels yet"
-                : activeTab === "tagged"
-                ? "No tagged posts"
-                : "No saved posts"}
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setShowFilters(!showFilters)}
+                className={`rounded-lg p-1.5 transition-colors ${showFilters ? "bg-primary text-primary-foreground" : "bg-secondary text-foreground"}`}
+                title="Filters"
+              >
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+              </button>
+              <button
+                onClick={() => setGridLayout(gridLayout === "grid-3" ? "grid-2" : gridLayout === "grid-2" ? "list" : "grid-3")}
+                className="rounded-lg bg-secondary p-1.5 text-foreground"
+                title="Layout"
+              >
+                {gridLayout === "list" ? <List className="h-3.5 w-3.5" /> : <LayoutGrid className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+          </div>
+
+          {showFilters && (
+            <div className="mx-2 mb-2 flex gap-2 rounded-lg border border-border bg-secondary/40 p-2">
+              <button
+                onClick={() => setSortBy("recent")}
+                className={`flex-1 rounded-md px-2 py-1.5 text-xs font-semibold transition-colors ${sortBy === "recent" ? "bg-foreground text-background" : "bg-background/60 text-foreground"}`}
+              >
+                Recent
+              </button>
+              <button
+                onClick={() => setSortBy("popular")}
+                className={`flex-1 rounded-md px-2 py-1.5 text-xs font-semibold transition-colors ${sortBy === "popular" ? "bg-foreground text-background" : "bg-background/60 text-foreground"}`}
+              >
+                Popular
+              </button>
+              {(activeTab === "posts" || activeTab === "reels") && (
+                <button
+                  onClick={() => setSortBy("pinned")}
+                  className={`flex-1 rounded-md px-2 py-1.5 text-xs font-semibold transition-colors ${sortBy === "pinned" ? "bg-foreground text-background" : "bg-background/60 text-foreground"}`}
+                >
+                  Pinned
+                </button>
+              )}
+              {(activeTab === "posts" || activeTab === "reels") && (
+                <button
+                  onClick={() => setPinnedOnly((prev) => !prev)}
+                  className={`flex-1 rounded-md px-2 py-1.5 text-xs font-semibold transition-colors ${pinnedOnly ? "bg-primary text-primary-foreground" : "bg-background/60 text-foreground"}`}
+                >
+                  Pinned only
+                </button>
+              )}
             </div>
           )}
+
+        <div className={`gap-0.5 p-0.5 ${
+          gridLayout === "grid-3" ? "grid grid-cols-3" : gridLayout === "grid-2" ? "grid grid-cols-2" : "flex flex-col gap-2 px-2"
+        }`}>
+          {currentVideos.map((video: any) => (
+            <div 
+              key={video.id} 
+              className={`relative overflow-hidden bg-secondary group cursor-pointer transition-transform hover:scale-[1.02] ${
+                gridLayout === "list" ? "rounded-lg" : "aspect-[9/16]"
+              }`}
+              onContextMenu={(e) => {
+                if (isOwnProfile) {
+                  e.preventDefault();
+                  setLongPressVideoId(video.id);
+                }
+              }}
+              onMouseEnter={() => setHoveredVideoId(video.id)}
+              onMouseLeave={() => setHoveredVideoId(null)}
+            >
+              <div className={gridLayout === "list" ? "flex gap-3 p-2" : "relative h-full w-full"}>
+                <div className={gridLayout === "list" ? "h-24 w-16 shrink-0 overflow-hidden rounded bg-secondary" : "h-full w-full"}>
+                  {video.thumbnail_url ? (
+                    <img src={video.thumbnail_url} alt="" className="h-full w-full object-cover" loading="lazy" />
+                  ) : video.video_url ? (
+                    hoveredVideoId === video.id && gridLayout !== "list" ? (
+                      <video 
+                        src={video.video_url} 
+                        className="h-full w-full object-cover" 
+                        autoPlay 
+                        muted 
+                        loop
+                        playsInline
+                      />
+                    ) : (
+                      <video src={video.video_url} className="h-full w-full object-cover" muted preload="metadata" />
+                    )
+                  ) : (
+                    <div className="flex h-full items-center justify-center">
+                      <Play className="h-6 w-6 text-muted-foreground" />
+                    </div>
+                  )}
+                  {hoveredVideoId === video.id && gridLayout !== "list" && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/20">
+                      <div className="rounded-full bg-white/90 p-3">
+                        <Play className="h-6 w-6 text-black" fill="black" />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {gridLayout === "list" && (
+                  <div className="flex min-w-0 flex-1 flex-col justify-between">
+                    <div>
+                      <p className="line-clamp-2 text-xs text-foreground">{video.description || "No caption"}</p>
+                      <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
+                        <span className="flex items-center gap-0.5">
+                          <Eye className="h-3 w-3" />
+                          {video.views_count || 0}
+                        </span>
+                        <span className="flex items-center gap-0.5">
+                          <Heart className="h-3 w-3" />
+                          {video.likes_count || 0}
+                        </span>
+                        <span className="flex items-center gap-0.5">
+                          <MessageCircle className="h-3 w-3" />
+                          {video.comments_count || 0}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                      <Clock className="h-3 w-3" />
+                      {new Date(video.created_at).toLocaleDateString()}
+                    </div>
+                  </div>
+                )}
+
+                {gridLayout !== "list" && (
+                  <>
+                    {pinnedVideoIds.has(video.id) && (
+                      <div className="absolute right-1 top-1 rounded-full bg-black/60 p-1">
+                        <Pin className="h-3 w-3 text-white" />
+                      </div>
+                    )}
+                    
+                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-2 pt-8">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 text-white">
+                          <span className="flex items-center gap-0.5 text-[10px] font-medium">
+                            <Heart className="h-3 w-3" fill="white" />
+                            {video.likes_count || 0}
+                          </span>
+                          <span className="flex items-center gap-0.5 text-[10px] font-medium">
+                            <MessageCircle className="h-3 w-3" />
+                            {video.comments_count || 0}
+                          </span>
+                          {video.views_count > 0 && (
+                            <span className="flex items-center gap-0.5 text-[10px] font-medium">
+                              <Eye className="h-3 w-3" />
+                              {video.views_count}
+                            </span>
+                          )}
+                        </div>
+                        {isOwnProfile && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setLongPressVideoId(video.id);
+                            }}
+                            className="rounded-full bg-black/60 p-1 opacity-0 transition-opacity group-hover:opacity-100"
+                          >
+                            <MoreHorizontal className="h-3 w-3 text-white" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {gridLayout === "list" && isOwnProfile && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setLongPressVideoId(video.id);
+                  }}
+                  className="absolute right-2 top-2 rounded-lg bg-secondary p-1.5"
+                >
+                  <MoreHorizontal className="h-3.5 w-3.5 text-foreground" />
+                </button>
+              )}
+            </div>
+          ))}
+          {currentVideos.length === 0 && !isRefreshing && (
+            <div className="col-span-3 px-4 py-16 text-center animate-in fade-in duration-500">
+              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-secondary">
+                {activeTab === "saved" ? <Bookmark className="h-6 w-6 text-muted-foreground" /> : <Play className="h-6 w-6 text-muted-foreground" />}
+              </div>
+              <p className="mt-3 text-sm font-semibold text-foreground">
+                {activeTab === "posts"
+                  ? "No posts yet"
+                  : activeTab === "reels"
+                  ? "No reels yet"
+                  : activeTab === "tagged"
+                  ? "No tagged posts"
+                  : "No saved posts"}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {activeTab === "tagged"
+                  ? "Posts where this account is tagged will show up here."
+                  : activeTab === "saved"
+                  ? "Saved videos will appear here for quick access."
+                  : "Your published videos will appear in this tab."}
+              </p>
+              {isOwnProfile && (activeTab === "posts" || activeTab === "reels") && (
+                <button
+                  onClick={() => navigate("/create")}
+                  className="mt-3 rounded-lg bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground"
+                >
+                  Create now
+                </button>
+              )}
+            </div>
+          )}
+          {isRefreshing && currentVideos.length === 0 && (
+            <div className="col-span-3 flex flex-col items-center justify-center py-16">
+              <Loader2 className="h-8 w-8 animate-spin text-primary" />
+              <p className="mt-2 text-xs text-muted-foreground">Loading...</p>
+            </div>
+          )}
+        </div>
         </div>
       )}
 
@@ -655,9 +1115,195 @@ const Profile = () => {
           }}
         />
       )}
+
+      {longPressVideoId && isOwnProfile && (
+        <VideoContextMenu
+          videoId={longPressVideoId}
+          video={currentVideos.find((v: any) => v.id === longPressVideoId)}
+          onClose={() => setLongPressVideoId(null)}
+          onPin={async (videoId, isPinned) => {
+            try {
+              await togglePinVideo.mutateAsync({ videoId, isPinned });
+              toast.success(isPinned ? "Post pinned" : "Post unpinned");
+            } catch (error: any) {
+              toast.error(error.message || "Unable to change pin status");
+            }
+          }}
+          onShare={(videoId) => {
+            navigator.clipboard.writeText(`${window.location.origin}/clipy?focus=${videoId}`);
+            toast.success("Video link copied");
+            setLongPressVideoId(null);
+          }}
+          onDownload={(video) => {
+            const mediaUrl = video?.video_url || video?.thumbnail_url;
+            if (!mediaUrl) {
+              toast.error("No media available to download");
+              return;
+            }
+
+            try {
+              const link = document.createElement("a");
+              link.href = mediaUrl;
+              link.download = `opium-${video?.id || "video"}.${video?.video_url ? "mp4" : "jpg"}`;
+              document.body.appendChild(link);
+              link.click();
+              document.body.removeChild(link);
+              toast.success("Download started");
+            } catch {
+              toast.error("Could not start download");
+            }
+          }}
+          onHide={async (videoId) => {
+            try {
+              await hideVideo.mutateAsync({ videoId });
+              setExcludedVideoIds((prev) => new Set(prev).add(videoId));
+              toast.success("Video hidden from profile view");
+            } catch {
+              toast.error("Could not hide video");
+            }
+          }}
+          onDelete={async (videoId) => {
+            if (!user) {
+              toast.error("Sign in required");
+              return;
+            }
+
+            try {
+              const { error } = await supabase
+                .from("videos")
+                .delete()
+                .eq("id", videoId)
+                .eq("user_id", user.id);
+              if (error) throw error;
+
+              setExcludedVideoIds((prev) => new Set(prev).add(videoId));
+              toast.success("Video deleted");
+            } catch {
+              toast.error("Could not delete video");
+            }
+          }}
+        />
+      )}
     </div>
   );
 };
+
+function VideoContextMenu({
+  videoId,
+  video,
+  onClose,
+  onPin,
+  onShare,
+  onDownload,
+  onHide,
+  onDelete,
+}: {
+  videoId: string;
+  video: any;
+  onClose: () => void;
+  onPin: (videoId: string, isPinned: boolean) => Promise<void>;
+  onShare: (videoId: string) => void;
+  onDownload: (video: any) => void;
+  onHide: (videoId: string) => Promise<void>;
+  onDelete: (videoId: string) => Promise<void>;
+}) {
+  const [pendingAction, setPendingAction] = useState<"pin" | "download" | "hide" | "delete" | null>(null);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end bg-black/50" onClick={onClose}>
+      <div className="w-full rounded-t-2xl bg-background p-4" onClick={(e) => e.stopPropagation()}>
+        <div className="mx-auto mb-3 h-1 w-12 rounded-full bg-border" />
+        <div className="space-y-1">
+          <button
+            onClick={async () => {
+              if (pendingAction) return;
+              setPendingAction("pin");
+              try {
+                await onPin(videoId, !video?.is_pinned);
+                onClose();
+              } finally {
+                setPendingAction(null);
+              }
+            }}
+            disabled={!!pendingAction}
+            className="flex w-full items-center gap-3 rounded-lg p-3 text-left hover:bg-secondary"
+          >
+            <Pin className="h-4 w-4 text-foreground" />
+            <span className="text-sm font-medium text-foreground">{video?.is_pinned ? "Unpin from profile" : "Pin to profile"}</span>
+          </button>
+          <button
+            onClick={() => onShare(videoId)}
+            disabled={!!pendingAction}
+            className="flex w-full items-center gap-3 rounded-lg p-3 text-left hover:bg-secondary"
+          >
+            <Share2 className="h-4 w-4 text-foreground" />
+            <span className="text-sm font-medium text-foreground">Share video</span>
+          </button>
+          <button
+            onClick={async () => {
+              if (pendingAction) return;
+              setPendingAction("download");
+              try {
+                onDownload(video);
+                onClose();
+              } finally {
+                setPendingAction(null);
+              }
+            }}
+            disabled={!!pendingAction}
+            className="flex w-full items-center gap-3 rounded-lg p-3 text-left hover:bg-secondary"
+          >
+            <Download className="h-4 w-4 text-foreground" />
+            <span className="text-sm font-medium text-foreground">Download video</span>
+          </button>
+          <button
+            onClick={async () => {
+              if (pendingAction) return;
+              setPendingAction("hide");
+              try {
+                await onHide(videoId);
+                onClose();
+              } finally {
+                setPendingAction(null);
+              }
+            }}
+            disabled={!!pendingAction}
+            className="flex w-full items-center gap-3 rounded-lg p-3 text-left hover:bg-secondary"
+          >
+            <EyeOff className="h-4 w-4 text-foreground" />
+            <span className="text-sm font-medium text-foreground">Hide from profile</span>
+          </button>
+          <button
+            onClick={async () => {
+              if (pendingAction) return;
+              if (window.confirm("Delete this video? This action cannot be undone.")) {
+                setPendingAction("delete");
+                try {
+                  await onDelete(videoId);
+                } finally {
+                  setPendingAction(null);
+                }
+              }
+              onClose();
+            }}
+            disabled={!!pendingAction}
+            className="flex w-full items-center gap-3 rounded-lg p-3 text-left hover:bg-destructive/10"
+          >
+            <Trash2 className="h-4 w-4 text-destructive" />
+            <span className="text-sm font-medium text-destructive">Delete video</span>
+          </button>
+        </div>
+        <button
+          onClick={onClose}
+          disabled={!!pendingAction}
+          className="mt-3 w-full rounded-lg border border-border bg-secondary py-3 text-sm font-semibold text-foreground"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function HiddenVideosModal({
   videos,
@@ -782,7 +1428,6 @@ function EditProfileModal({
   const [affiliateUrl, setAffiliateUrl] = useState(profile?.affiliate_url || "");
   const [shopUrl, setShopUrl] = useState(profile?.shop_url || "");
   const [isPrivate, setIsPrivate] = useState(!!profile?.is_private);
-  const [isVerified, setIsVerified] = useState(!!profile?.is_verified);
   const [showLastActive, setShowLastActive] = useState(profile?.show_last_active !== false);
   const [professionalAccount, setProfessionalAccount] = useState(!!profile?.professional_account);
   const [newLinkLabel, setNewLinkLabel] = useState("");
@@ -836,7 +1481,6 @@ function EditProfileModal({
         affiliate_url: affiliateUrl.trim() || null,
         shop_url: shopUrl.trim() || null,
         is_private: isPrivate,
-        is_verified: isVerified,
         show_last_active: showLastActive,
         professional_account: professionalAccount,
       });
@@ -910,10 +1554,6 @@ function EditProfileModal({
             <label className="flex items-center justify-between">
               <span>Private account</span>
               <input type="checkbox" checked={isPrivate} onChange={(event) => setIsPrivate(event.target.checked)} />
-            </label>
-            <label className="flex items-center justify-between">
-              <span>Verified badge (admin)</span>
-              <input type="checkbox" checked={isVerified} onChange={(event) => setIsVerified(event.target.checked)} />
             </label>
             <label className="flex items-center justify-between">
               <span>Show last active</span>

@@ -11,6 +11,29 @@ const isSchemaMismatchError = (error: any) => {
   );
 };
 
+const extractMentionUsernames = (text: string) => {
+  const matches = text.match(/@[\w.]+/g) || [];
+  return Array.from(new Set(matches.map((value) => value.replace("@", "").toLowerCase())));
+};
+
+const ensureMentionTargetsAllowMentions = async (mentionUsernames: string[]) => {
+  if (mentionUsernames.length === 0) return;
+
+  const { data: mentionProfiles, error: mentionProfilesError } = await supabase
+    .from("profiles")
+    .select("username, allow_mentions")
+    .in("username", mentionUsernames);
+  if (mentionProfilesError && !isSchemaMismatchError(mentionProfilesError)) throw mentionProfilesError;
+
+  const disallowed = (mentionProfiles || [])
+    .filter((profile: any) => profile.allow_mentions === false)
+    .map((profile: any) => `@${profile.username}`);
+
+  if (disallowed.length > 0) {
+    throw new Error(`Mentions are restricted for: ${disallowed.join(", ")}`);
+  }
+};
+
 export interface VideoComment {
   id: string;
   user_id: string;
@@ -52,6 +75,30 @@ const loadSafetyFilters = async (userId: string) => {
   };
 };
 
+const withPlayableVideoUrl = (video: any) => {
+  const directUrl = String(video?.video_url || "").trim();
+  const playbackId = String(video?.stream_playback_id || "").trim();
+
+  if (directUrl) {
+    return {
+      ...video,
+      video_url: directUrl,
+    };
+  }
+
+  if (playbackId) {
+    return {
+      ...video,
+      video_url: `https://stream.mux.com/${playbackId}.m3u8`,
+    };
+  }
+
+  return {
+    ...video,
+    video_url: "",
+  };
+};
+
 function updateVideosCommentsCount(
   queryClient: ReturnType<typeof useQueryClient>,
   videoId: string,
@@ -82,11 +129,14 @@ export function useVideos() {
         .order("created_at", { ascending: false });
       if (error) throw error;
 
-      if (!user) return data;
+      const normalized = (data || []).map((video: any) => withPlayableVideoUrl(video));
+      const playable = normalized.filter((video: any) => !!video.video_url);
+
+      if (!user) return playable;
 
       const { hiddenVideoIds, blockedUserIds, mutedUserIds } = await loadSafetyFilters(user.id);
 
-      return (data || []).filter(
+      return playable.filter(
         (video: any) =>
           !hiddenVideoIds.has(video.id) &&
           !blockedUserIds.has(video.user_id) &&
@@ -109,7 +159,71 @@ export function useForYouVideos() {
         .limit(150);
       if (error) throw error;
 
-      if (!user) return videos || [];
+      if (!user) {
+        return (videos || [])
+          .map((video: any) => withPlayableVideoUrl(video))
+          .filter((video: any) => !!video.video_url);
+      }
+
+      const logForYouTelemetry = (
+        rows: Array<{ video_id: string; score: number; rank_position: number; components?: Record<string, any> }>,
+      ) => {
+        if (!rows.length) return;
+
+        const payload = rows.slice(0, 30).map((row) => ({
+          video_id: row.video_id,
+          score: row.score,
+          rank_position: row.rank_position,
+          components: row.components || {},
+        }));
+
+        void supabase
+          .rpc("log_for_you_ranking_batch", {
+            rows_payload: payload,
+            surface_name: "for_you",
+          })
+          .then(({ error: telemetryError }) => {
+            if (telemetryError && !isSchemaMismatchError(telemetryError)) {
+              console.warn("Failed to log feed ranking telemetry", telemetryError.message);
+            }
+          });
+      };
+
+      const rpcResult = await supabase.rpc("get_for_you_video_ids", { limit_count: 150 });
+      if (!rpcResult.error && rpcResult.data) {
+        const orderedIds = rpcResult.data.map((row: any) => row.video_id).filter(Boolean);
+        if (orderedIds.length === 0) return [];
+
+        logForYouTelemetry(
+          rpcResult.data.map((row: any, index: number) => ({
+            video_id: row.video_id,
+            score: Number(row.score || 0),
+            rank_position: index + 1,
+            components: { source: "rpc" },
+          })),
+        );
+
+        const { data: rankedVideos, error: rankedVideosError } = await supabase
+          .from("videos")
+          .select("*, profiles!videos_user_id_fkey(username, display_name, avatar_url)")
+          .in("id", orderedIds);
+
+        if (rankedVideosError) throw rankedVideosError;
+
+        const byId = new Map(
+          (rankedVideos || []).map((video: any) => {
+            const normalizedVideo = withPlayableVideoUrl(video);
+            return [normalizedVideo.id, normalizedVideo];
+          }),
+        );
+        return orderedIds
+          .map((id: string) => byId.get(id))
+          .filter((video: any) => !!video?.video_url);
+      }
+
+      if (rpcResult.error && !isSchemaMismatchError(rpcResult.error)) {
+        throw rpcResult.error;
+      }
 
       const [{ hiddenVideoIds, blockedUserIds, mutedUserIds }, eventsRes, followsRes, interestsRes] = await Promise.all([
         loadSafetyFilters(user.id),
@@ -156,7 +270,10 @@ export function useForYouVideos() {
       const followedSet = new Set((followsRes.data || []).map((row: any) => row.following_id));
       const interests = (interestsRes.data?.interests || []).map((interest: string) => interest.toLowerCase());
 
-      const filtered = (videos || []).filter(
+      const filtered = (videos || [])
+        .map((video: any) => withPlayableVideoUrl(video))
+        .filter((video: any) => !!video.video_url)
+        .filter(
         (video: any) =>
           !hiddenVideoIds.has(video.id) &&
           !blockedUserIds.has(video.user_id) &&
@@ -189,6 +306,15 @@ export function useForYouVideos() {
           };
         })
         .sort((a: any, b: any) => b._score - a._score);
+
+      logForYouTelemetry(
+        ranked.map((video: any, index: number) => ({
+          video_id: video.id,
+          score: Number(video._score || 0),
+          rank_position: index + 1,
+          components: { source: "client_fallback" },
+        })),
+      );
 
       return ranked;
     },
@@ -323,6 +449,29 @@ export function useAddComment() {
         throw new Error("Comment cannot be empty");
       }
 
+      const { data: videoRow, error: videoError } = await supabase
+        .from("videos")
+        .select("user_id")
+        .eq("id", videoId)
+        .maybeSingle();
+      if (videoError) throw videoError;
+
+      if (videoRow?.user_id) {
+        const { data: ownerProfile, error: ownerProfileError } = await supabase
+          .from("profiles")
+          .select("allow_comments")
+          .eq("user_id", videoRow.user_id)
+          .maybeSingle();
+        if (ownerProfileError && !isSchemaMismatchError(ownerProfileError)) throw ownerProfileError;
+
+        if (ownerProfile?.allow_comments === false && videoRow.user_id !== user.id) {
+          throw new Error("This creator has turned off comments");
+        }
+      }
+
+      const mentionUsernames = extractMentionUsernames(trimmedContent);
+      await ensureMentionTargetsAllowMentions(mentionUsernames);
+
       const { error } = await supabase
         .from("comments")
         .insert({
@@ -436,14 +585,23 @@ export function useToggleLike() {
     mutationFn: async ({ videoId, isLiked }: { videoId: string; isLiked: boolean }) => {
       if (!user) throw new Error("Not authenticated");
       if (isLiked) {
-        await supabase.from("likes").delete().eq("user_id", user.id).eq("video_id", videoId);
+        const { error } = await supabase
+          .from("likes")
+          .delete()
+          .eq("user_id", user.id)
+          .eq("video_id", videoId);
+        if (error) throw error;
       } else {
-        await supabase.from("likes").insert({ user_id: user.id, video_id: videoId });
+        const { error } = await supabase
+          .from("likes")
+          .insert({ user_id: user.id, video_id: videoId });
+        if (error) throw error;
       }
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["user-likes"] });
       qc.invalidateQueries({ queryKey: ["videos"] });
+      qc.invalidateQueries({ queryKey: ["for-you-videos"] });
     },
   });
 }
@@ -671,6 +829,153 @@ export function useMarkAllNotificationsRead() {
   });
 }
 
+export function useMarkMessageRequestNotificationsRead() {
+  const { user } = useAuth();
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: async () => {
+      if (!user) throw new Error("Not authenticated");
+      const { error } = await supabase
+        .from("notifications")
+        .update({ is_read: true })
+        .eq("user_id", user.id)
+        .eq("type", "message_request")
+        .eq("is_read", false);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notifications"] });
+      qc.invalidateQueries({ queryKey: ["notifications-unread-count"] });
+    },
+  });
+}
+
+export function useMarkNotificationRead() {
+  const { user } = useAuth();
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ notificationId }: { notificationId: string }) => {
+      if (!user) throw new Error("Not authenticated");
+      const { error } = await supabase
+        .from("notifications")
+        .update({ is_read: true })
+        .eq("id", notificationId)
+        .eq("user_id", user.id)
+        .eq("is_read", false);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notifications"] });
+      qc.invalidateQueries({ queryKey: ["notifications-unread-count"] });
+    },
+  });
+}
+
+export function useDeleteNotification() {
+  const { user } = useAuth();
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ notificationId }: { notificationId: string }) => {
+      if (!user) throw new Error("Not authenticated");
+      const { error } = await supabase
+        .from("notifications")
+        .delete()
+        .eq("id", notificationId)
+        .eq("user_id", user.id);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notifications"] });
+      qc.invalidateQueries({ queryKey: ["notifications-unread-count"] });
+    },
+  });
+}
+
+export function useInboxNotes(limit = 24) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["inbox-notes", user?.id, limit],
+    enabled: !!user,
+    queryFn: async () => {
+      const { data: followingRows, error: followError } = await supabase
+        .from("follows")
+        .select("following_id")
+        .eq("follower_id", user!.id);
+      if (followError) throw followError;
+
+      const visibleUserIds = [
+        user!.id,
+        ...(followingRows || []).map((row: any) => row.following_id),
+      ];
+
+      const { data: notes, error } = await (supabase as any)
+        .from("inbox_notes")
+        .select("id, user_id, content, created_at, expires_at")
+        .in("user_id", visibleUserIds)
+        .gt("expires_at", new Date().toISOString())
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      if (error) {
+        if (isSchemaMismatchError(error)) return [];
+        throw error;
+      }
+
+      const noteUserIds = Array.from(new Set((notes || []).map((row: any) => row.user_id)));
+      if (noteUserIds.length === 0) return [];
+
+      const { data: profiles, error: profileError } = await supabase
+        .from("profiles")
+        .select("user_id, username, display_name, avatar_url")
+        .in("user_id", noteUserIds);
+      if (profileError) throw profileError;
+
+      const profileMap = new Map((profiles || []).map((profile: any) => [profile.user_id, profile]));
+
+      return (notes || []).map((note: any) => ({
+        ...note,
+        profile: profileMap.get(note.user_id) || null,
+      }));
+    },
+  });
+}
+
+export function useUpsertInboxNote() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ content }: { content: string }) => {
+      if (!user) throw new Error("Not authenticated");
+
+      const trimmed = content.trim();
+      if (!trimmed) throw new Error("Note cannot be empty");
+      if (trimmed.length > 60) throw new Error("Note must be 60 characters or less");
+
+      const { error } = await (supabase as any)
+        .from("inbox_notes")
+        .upsert(
+          {
+            user_id: user.id,
+            content: trimmed,
+            created_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          },
+          { onConflict: "user_id" },
+        );
+
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["inbox-notes"] });
+    },
+  });
+}
+
 export function useUnreadNotificationsCount() {
   const { user } = useAuth();
 
@@ -856,14 +1161,23 @@ export function useToggleBookmark() {
     mutationFn: async ({ videoId, isBookmarked }: { videoId: string; isBookmarked: boolean }) => {
       if (!user) throw new Error("Not authenticated");
       if (isBookmarked) {
-        await supabase.from("bookmarks").delete().eq("user_id", user.id).eq("video_id", videoId);
+        const { error } = await supabase
+          .from("bookmarks")
+          .delete()
+          .eq("user_id", user.id)
+          .eq("video_id", videoId);
+        if (error) throw error;
       } else {
-        await supabase.from("bookmarks").insert({ user_id: user.id, video_id: videoId });
+        const { error } = await supabase
+          .from("bookmarks")
+          .insert({ user_id: user.id, video_id: videoId });
+        if (error) throw error;
       }
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["user-bookmarks"] });
       qc.invalidateQueries({ queryKey: ["videos"] });
+      qc.invalidateQueries({ queryKey: ["for-you-videos"] });
     },
   });
 }
@@ -924,6 +1238,230 @@ export function useFollowingList(userId: string | undefined, enabled = true) {
         .in("user_id", ids);
       if (pErr) throw pErr;
       return profiles || [];
+    },
+  });
+}
+
+export function useFollowRecommendations(limit = 12, enabled = true) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["follow-recommendations", user?.id, limit],
+    enabled: !!user && enabled,
+    queryFn: async () => {
+      const rpc = await supabase.rpc("get_follow_recommendations", { limit_count: limit });
+      if (!rpc.error) return rpc.data || [];
+      if (!isSchemaMismatchError(rpc.error)) throw rpc.error;
+
+      const followingRes = await supabase
+        .from("follows")
+        .select("following_id")
+        .eq("follower_id", user!.id);
+      if (followingRes.error) throw followingRes.error;
+
+      const excludeIds = new Set((followingRes.data || []).map((row: any) => row.following_id));
+      excludeIds.add(user!.id);
+
+      const { data: profiles, error: profilesError } = await supabase
+        .from("profiles")
+        .select("user_id, username, display_name, avatar_url, is_private, is_verified")
+        .limit(100);
+      if (profilesError) throw profilesError;
+
+      return (profiles || [])
+        .filter((profile: any) => !excludeIds.has(profile.user_id))
+        .slice(0, limit)
+        .map((profile: any) => ({
+          ...profile,
+          score: 0,
+        }));
+    },
+  });
+}
+
+export function useLogCreatorRecommendationExposure() {
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ suggestedUserIds, surface = "discover" }: { suggestedUserIds: string[]; surface?: string }) => {
+      if (!user) return;
+      if (!suggestedUserIds.length) return;
+
+      const { error } = await supabase.rpc("log_creator_recommendation_exposure_batch", {
+        suggested_user_ids: suggestedUserIds,
+        surface_name: surface,
+      });
+      if (error && !isSchemaMismatchError(error)) throw error;
+    },
+  });
+}
+
+export function useLogCreatorRecommendationClick() {
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ suggestedUserId, surface = "discover" }: { suggestedUserId: string; surface?: string }) => {
+      if (!user) return;
+      if (!suggestedUserId) return;
+
+      const { error } = await supabase.rpc("log_creator_recommendation_click", {
+        suggested_user_id_input: suggestedUserId,
+        surface_name: surface,
+      });
+      if (error && !isSchemaMismatchError(error)) throw error;
+    },
+  });
+}
+
+export function useLogMessageRequestAction() {
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ conversationId, action, surface = "inbox" }: { conversationId: string; action: "accept" | "delete"; surface?: string }) => {
+      if (!user) return;
+      if (!conversationId) return;
+
+      const { error } = await (supabase as any).rpc("log_message_request_action", {
+        conversation_id_input: conversationId,
+        action_input: action,
+        surface_name: surface,
+      });
+      if (error && !isSchemaMismatchError(error)) throw error;
+    },
+  });
+}
+
+export function useMessageRequestAdminMetrics(windowDays = 7) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["message-request-admin-metrics", user?.id, windowDays],
+    enabled: !!user,
+    queryFn: async () => {
+      const { data, error } = await (supabase as any).rpc("get_message_request_admin_metrics", {
+        window_days: windowDays,
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? (data[0] || null) : data;
+    },
+  });
+}
+
+export function useMessageRequestAdminAlerts(windowDays = 7, deleteRateThresholdPercent = 70, minActions = 20) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["message-request-admin-alerts", user?.id, windowDays, deleteRateThresholdPercent, minActions],
+    enabled: !!user,
+    queryFn: async () => {
+      const { data, error } = await (supabase as any).rpc("get_message_request_alerts", {
+        window_days: windowDays,
+        delete_rate_threshold_percent: deleteRateThresholdPercent,
+        min_actions: minActions,
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? (data[0] || null) : data;
+    },
+  });
+}
+
+export function useRunMessageRequestCriticalMitigation() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({
+      windowDays = 7,
+      deleteRateThresholdPercent = 70,
+      minActions = 20,
+      throttleHours = 24,
+      maxSenders = 5,
+    }: {
+      windowDays?: number;
+      deleteRateThresholdPercent?: number;
+      minActions?: number;
+      throttleHours?: number;
+      maxSenders?: number;
+    } = {}) => {
+      if (!user) throw new Error("Not authenticated");
+      await ensureCurrentUserIsAdmin(user.id);
+
+      const { data, error } = await (supabase as any).rpc("run_message_request_critical_mitigation", {
+        window_days: windowDays,
+        delete_rate_threshold_percent: deleteRateThresholdPercent,
+        min_actions: minActions,
+        throttle_hours: throttleHours,
+        max_senders: maxSenders,
+      });
+      if (error) throw error;
+      return data || [];
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["message-request-admin-metrics"] });
+      qc.invalidateQueries({ queryKey: ["message-request-admin-alerts"] });
+      qc.invalidateQueries({ queryKey: ["admin-audit-logs"] });
+    },
+  });
+}
+
+export function useActiveMessageRequestSenderThrottles(limit = 100) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["message-request-active-throttles", user?.id, limit],
+    enabled: !!user,
+    queryFn: async () => {
+      await ensureCurrentUserIsAdmin(user!.id);
+
+      const { data, error } = await (supabase as any).rpc("get_active_message_request_sender_throttles", {
+        limit_count: limit,
+      });
+      if (error) throw error;
+      return data || [];
+    },
+  });
+}
+
+export function useReleaseMessageRequestSenderThrottle() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ senderId, reason = "manual_admin_release" }: { senderId: string; reason?: string }) => {
+      if (!user) throw new Error("Not authenticated");
+      await ensureCurrentUserIsAdmin(user.id);
+
+      const { data, error } = await (supabase as any).rpc("release_message_request_sender_throttle", {
+        sender_id_input: senderId,
+        release_reason: reason,
+      });
+      if (error) throw error;
+      return !!data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["message-request-active-throttles"] });
+      qc.invalidateQueries({ queryKey: ["admin-audit-logs"] });
+    },
+  });
+}
+
+export function useCleanupExpiredMessageRequestSenderThrottles() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async () => {
+      if (!user) throw new Error("Not authenticated");
+      await ensureCurrentUserIsAdmin(user.id);
+
+      const { data, error } = await (supabase as any).rpc("cleanup_expired_message_request_sender_throttles");
+      if (error) throw error;
+      const row = Array.isArray(data) ? data[0] : data;
+      return Number(row?.released_count || 0);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["message-request-active-throttles"] });
+      qc.invalidateQueries({ queryKey: ["admin-audit-logs"] });
     },
   });
 }
@@ -1121,6 +1659,7 @@ export function useToggleFollow() {
       qc.invalidateQueries({ queryKey: ["follow-counts"] });
       qc.invalidateQueries({ queryKey: ["followers-list"] });
       qc.invalidateQueries({ queryKey: ["following-list"] });
+      qc.invalidateQueries({ queryKey: ["follow-recommendations"] });
     },
   });
 }
@@ -1324,7 +1863,7 @@ export function useCreatorMetrics(userId: string | undefined) {
     queryFn: async () => {
       const { data: videos, error } = await supabase
         .from("videos")
-        .select("id, likes_count, comments_count, shares_count")
+        .select("id, thumbnail_url, likes_count, comments_count, shares_count")
         .eq("user_id", userId!);
       if (error) throw error;
 
@@ -1481,9 +2020,16 @@ export function useUpdateProfile() {
       affiliate_url?: string | null;
       shop_url?: string | null;
       is_private?: boolean;
-      is_verified?: boolean;
       show_last_active?: boolean;
       professional_account?: boolean;
+      allow_comments?: boolean;
+      allow_mentions?: boolean;
+      allow_messages_from?: "everyone" | "following" | "none";
+      push_likes?: boolean;
+      push_comments?: boolean;
+      push_messages?: boolean;
+      two_factor_enabled?: boolean;
+      login_alerts?: boolean;
     }) => {
       if (!user) throw new Error("Not authenticated");
       const { error } = await supabase
@@ -1494,6 +2040,485 @@ export function useUpdateProfile() {
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["profile"] });
+    },
+  });
+}
+
+export function useUserSettings() {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["user-settings", user?.id],
+    enabled: !!user,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("user_settings")
+        .select("*")
+        .eq("user_id", user!.id)
+        .maybeSingle();
+
+      if (error) throw error;
+      return data ?? null;
+    },
+  });
+}
+
+export function useUpsertUserSettings() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async (updates: {
+      privacy?: Record<string, any>;
+      notifications?: Record<string, any>;
+      content?: Record<string, any>;
+      interactions?: Record<string, any>;
+      ads?: Record<string, any>;
+      accessibility?: Record<string, any>;
+      app?: Record<string, any>;
+    }) => {
+      if (!user) throw new Error("Not authenticated");
+
+      const current = await supabase
+        .from("user_settings")
+        .select("privacy, notifications, content, interactions, ads, accessibility, app")
+        .eq("user_id", user.id)
+        .maybeSingle();
+
+      if (current.error) throw current.error;
+
+      const payload = {
+        user_id: user.id,
+        privacy: {
+          ...(current.data?.privacy || {}),
+          ...(updates.privacy || {}),
+        },
+        notifications: {
+          ...(current.data?.notifications || {}),
+          ...(updates.notifications || {}),
+        },
+        content: {
+          ...(current.data?.content || {}),
+          ...(updates.content || {}),
+        },
+        interactions: {
+          ...(current.data?.interactions || {}),
+          ...(updates.interactions || {}),
+        },
+        ads: {
+          ...(current.data?.ads || {}),
+          ...(updates.ads || {}),
+        },
+        accessibility: {
+          ...(current.data?.accessibility || {}),
+          ...(updates.accessibility || {}),
+        },
+        app: {
+          ...(current.data?.app || {}),
+          ...(updates.app || {}),
+        },
+      };
+
+      const { error } = await supabase.from("user_settings").upsert(payload, { onConflict: "user_id" });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-settings"] });
+    },
+  });
+}
+
+export function useAdminUpdateProfileStatus() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({
+      targetUserId,
+      isVerified,
+      isMonetized,
+    }: {
+      targetUserId: string;
+      isVerified: boolean;
+      isMonetized: boolean;
+    }) => {
+      if (!user) throw new Error("Not authenticated");
+
+      const { data: me, error: meError } = await supabase
+        .from("profiles")
+        .select("is_admin")
+        .eq("user_id", user.id)
+        .maybeSingle();
+
+      if (meError) throw meError;
+      if (!me?.is_admin) throw new Error("Only admins can update verification/monetization");
+
+      const { error } = await supabase
+        .from("profiles")
+        .update({
+          is_verified: isVerified,
+          is_monetized: isMonetized,
+        })
+        .eq("user_id", targetUserId);
+
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["profile"] });
+      qc.invalidateQueries({ queryKey: ["profiles"] });
+      qc.invalidateQueries({ queryKey: ["admin-audit-logs"] });
+    },
+  });
+}
+
+const ensureCurrentUserIsAdmin = async (userId: string) => {
+  const { data: me, error: meError } = await supabase
+    .from("profiles")
+    .select("is_admin")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (meError) throw meError;
+  if (!me?.is_admin) throw new Error("Admin access required");
+};
+
+export function useAdminProfiles(limit = 100) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["admin-profiles", user?.id, limit],
+    enabled: !!user,
+    queryFn: async () => {
+      await ensureCurrentUserIsAdmin(user!.id);
+
+      const { data, error } = await supabase
+        .from("profiles")
+        .select(
+          "user_id, username, display_name, avatar_url, is_private, is_verified, is_monetized, is_admin, professional_account, created_at",
+        )
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      if (error) throw error;
+      return data || [];
+    },
+  });
+}
+
+export function useAdminVideoReports(limit = 100) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["admin-video-reports", user?.id, limit],
+    enabled: !!user,
+    queryFn: async () => {
+      await ensureCurrentUserIsAdmin(user!.id);
+
+      const { data: reports, error: reportsError } = await supabase
+        .from("video_reports")
+        .select("id, reporter_id, video_id, reason, details, status, created_at")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      if (reportsError) throw reportsError;
+      if (!reports || reports.length === 0) return [];
+
+      const videoIds = [...new Set(reports.map((report) => report.video_id))];
+      const reporterIds = [...new Set(reports.map((report) => report.reporter_id))];
+
+      const { data: videos, error: videosError } = await supabase
+        .from("videos")
+        .select("id, user_id, description, thumbnail_url, video_url, created_at")
+        .in("id", videoIds);
+      if (videosError) throw videosError;
+
+      const ownerIds = [...new Set((videos || []).map((video) => video.user_id))];
+      const profileIds = [...new Set([...reporterIds, ...ownerIds])];
+
+      const { data: profiles, error: profilesError } = await supabase
+        .from("profiles")
+        .select("user_id, username, display_name, avatar_url")
+        .in("user_id", profileIds);
+      if (profilesError) throw profilesError;
+
+      const videoMap = new Map((videos || []).map((video) => [video.id, video]));
+      const profileMap = new Map((profiles || []).map((profile) => [profile.user_id, profile]));
+
+      return reports.map((report) => {
+        const video = videoMap.get(report.video_id);
+        return {
+          ...report,
+          video,
+          reporter_profile: profileMap.get(report.reporter_id) || null,
+          owner_profile: video ? profileMap.get(video.user_id) || null : null,
+        };
+      });
+    },
+  });
+}
+
+export function useAdminPriorityVideoReports(limit = 25) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["admin-priority-video-reports", user?.id, limit],
+    enabled: !!user,
+    queryFn: async () => {
+      await ensureCurrentUserIsAdmin(user!.id);
+
+      const rpc = await supabase.rpc("get_priority_video_reports", { limit_count: limit });
+      if (!rpc.error) return rpc.data || [];
+      if (!isSchemaMismatchError(rpc.error)) throw rpc.error;
+
+      const fallback = await supabase
+        .from("video_reports")
+        .select("id, reporter_id, video_id, reason, details, status, created_at")
+        .in("status", ["open", "reviewing"])
+        .order("created_at", { ascending: true })
+        .limit(limit);
+
+      if (fallback.error) throw fallback.error;
+
+      return (fallback.data || []).map((row: any) => ({
+        report_id: row.id,
+        video_id: row.video_id,
+        reporter_id: row.reporter_id,
+        owner_user_id: "",
+        reason: row.reason,
+        status: row.status,
+        details: row.details,
+        created_at: row.created_at,
+        reporter_username: "",
+        owner_username: "",
+        report_count_on_video: 1,
+        owner_open_reports: 1,
+        priority_score: 0,
+      }));
+    },
+  });
+}
+
+export function useCreatorRecommendationExperimentConfig() {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["creator-reco-experiment", user?.id],
+    enabled: !!user,
+    queryFn: async () => {
+      await ensureCurrentUserIsAdmin(user!.id);
+
+      const { data, error } = await supabase.rpc("get_creator_recommendation_experiment_admin");
+      if (error) throw error;
+      return data?.[0] || null;
+    },
+  });
+}
+
+export function useCreatorRecommendationExperimentMetrics(windowDays = 7) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["creator-reco-experiment-metrics", user?.id, windowDays],
+    enabled: !!user,
+    queryFn: async () => {
+      await ensureCurrentUserIsAdmin(user!.id);
+
+      const { data, error } = await supabase.rpc("get_creator_recommendation_experiment_metrics", {
+        window_days: windowDays,
+      });
+      if (error) throw error;
+      return data || [];
+    },
+  });
+}
+
+export function useCreatorRecommendationExperimentAlerts(windowDays = 7, ctrDropThresholdPercent = 10) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["creator-reco-experiment-alerts", user?.id, windowDays, ctrDropThresholdPercent],
+    enabled: !!user,
+    queryFn: async () => {
+      await ensureCurrentUserIsAdmin(user!.id);
+
+      const { data, error } = await supabase.rpc("get_creator_recommendation_experiment_alerts", {
+        window_days: windowDays,
+        ctr_drop_threshold_percent: ctrDropThresholdPercent,
+      });
+      if (error) throw error;
+      return data?.[0] || null;
+    },
+  });
+}
+
+export function useUpsertCreatorRecommendationExperiment() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({
+      name,
+      status,
+      controlWeights,
+      variantWeights,
+      exposureCap,
+    }: {
+      name: string;
+      status: "active" | "paused";
+      controlWeights: Record<string, number>;
+      variantWeights: Record<string, number>;
+      exposureCap: number;
+    }) => {
+      if (!user) throw new Error("Not authenticated");
+      await ensureCurrentUserIsAdmin(user.id);
+
+      const { data, error } = await supabase.rpc("upsert_creator_recommendation_experiment", {
+        experiment_name: name,
+        experiment_status: status,
+        control_weights_input: controlWeights,
+        variant_weights_input: variantWeights,
+        exposure_cap_input: exposureCap,
+      });
+      if (error) throw error;
+      return data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["creator-reco-experiment"] });
+      qc.invalidateQueries({ queryKey: ["follow-recommendations"] });
+    },
+  });
+}
+
+export function useAdminUpdateReportStatus() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ reportId, status }: { reportId: string; status: "open" | "reviewing" | "resolved" | "dismissed" }) => {
+      if (!user) throw new Error("Not authenticated");
+      await ensureCurrentUserIsAdmin(user.id);
+
+      const { error } = await supabase
+        .from("video_reports")
+        .update({ status })
+        .eq("id", reportId);
+
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["admin-video-reports"] });
+      qc.invalidateQueries({ queryKey: ["admin-priority-video-reports"] });
+      qc.invalidateQueries({ queryKey: ["admin-audit-logs"] });
+    },
+  });
+}
+
+export function useRunAbuseModerationAutomation() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ maxUpdates = 100 }: { maxUpdates?: number } = {}) => {
+      if (!user) throw new Error("Not authenticated");
+      await ensureCurrentUserIsAdmin(user.id);
+
+      const { data, error } = await supabase.rpc("run_abuse_moderation_automation", {
+        max_updates: maxUpdates,
+      });
+      if (error) throw error;
+      return data || [];
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["admin-video-reports"] });
+      qc.invalidateQueries({ queryKey: ["admin-priority-video-reports"] });
+      qc.invalidateQueries({ queryKey: ["admin-audit-logs"] });
+    },
+  });
+}
+
+export function useRunRetentionNudges() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ limitCount = 200 }: { limitCount?: number } = {}) => {
+      if (!user) throw new Error("Not authenticated");
+      await ensureCurrentUserIsAdmin(user.id);
+
+      const { data, error } = await supabase.rpc("run_retention_nudges", {
+        limit_count: limitCount,
+      });
+      if (error) throw error;
+      return data || [];
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notifications"] });
+      qc.invalidateQueries({ queryKey: ["notifications-unread-count"] });
+      qc.invalidateQueries({ queryKey: ["admin-audit-logs"] });
+    },
+  });
+}
+
+export function useAdminDeleteVideo() {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+
+  return useMutation({
+    mutationFn: async ({ videoId }: { videoId: string }) => {
+      if (!user) throw new Error("Not authenticated");
+      await ensureCurrentUserIsAdmin(user.id);
+
+      const { error } = await supabase
+        .from("videos")
+        .delete()
+        .eq("id", videoId);
+
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["admin-video-reports"] });
+      qc.invalidateQueries({ queryKey: ["admin-priority-video-reports"] });
+      qc.invalidateQueries({ queryKey: ["videos"] });
+      qc.invalidateQueries({ queryKey: ["for-you-videos"] });
+      qc.invalidateQueries({ queryKey: ["admin-audit-logs"] });
+    },
+  });
+}
+
+export function useAdminAuditLogs(limit = 200) {
+  const { user } = useAuth();
+
+  return useQuery({
+    queryKey: ["admin-audit-logs", user?.id, limit],
+    enabled: !!user,
+    queryFn: async () => {
+      await ensureCurrentUserIsAdmin(user!.id);
+
+      const { data: logs, error: logsError } = await supabase
+        .from("admin_audit_logs")
+        .select("id, actor_user_id, action, target_user_id, target_video_id, target_report_id, metadata, created_at")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      if (logsError) throw logsError;
+      if (!logs || logs.length === 0) return [];
+
+      const profileIds = [...new Set(
+        logs.flatMap((log) => [log.actor_user_id, log.target_user_id]).filter(Boolean) as string[],
+      )];
+
+      const { data: profiles, error: profilesError } = await supabase
+        .from("profiles")
+        .select("user_id, username, display_name, avatar_url")
+        .in("user_id", profileIds);
+      if (profilesError) throw profilesError;
+
+      const profileMap = new Map((profiles || []).map((profile) => [profile.user_id, profile]));
+
+      return logs.map((log) => ({
+        ...log,
+        actor_profile: profileMap.get(log.actor_user_id) || null,
+        target_profile: log.target_user_id ? profileMap.get(log.target_user_id) || null : null,
+      }));
     },
   });
 }

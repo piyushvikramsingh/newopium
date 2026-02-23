@@ -2,6 +2,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/useAuth";
 import { useEffect } from "react";
+import { buildOrIlikeClause, normalizeSearchInput } from "@/lib/search";
 
 const isSchemaMismatchError = (error: any) => {
   const message = String(error?.message || "").toLowerCase();
@@ -12,10 +13,61 @@ const isSchemaMismatchError = (error: any) => {
   );
 };
 
+const extractMentionUsernames = (text: string) => {
+  const matches = text.match(/@[\w.]+/g) || [];
+  return Array.from(new Set(matches.map((value) => value.replace("@", "").toLowerCase())));
+};
+
+const ensureMentionTargetsAllowMentions = async (mentionUsernames: string[]) => {
+  if (mentionUsernames.length === 0) return;
+
+  const { data: mentionProfiles, error: mentionProfilesError } = await supabase
+    .from("profiles")
+    .select("username, allow_mentions")
+    .in("username", mentionUsernames);
+  if (mentionProfilesError && !isSchemaMismatchError(mentionProfilesError)) throw mentionProfilesError;
+
+  const disallowed = (mentionProfiles || [])
+    .filter((profile: any) => profile.allow_mentions === false)
+    .map((profile: any) => `@${profile.username}`);
+
+  if (disallowed.length > 0) {
+    throw new Error(`Mentions are restricted for: ${disallowed.join(", ")}`);
+  }
+};
+
+const ensureCanMessageTarget = async (senderUserId: string, targetUserId: string) => {
+  const { data: targetProfile, error: targetProfileError } = await supabase
+    .from("profiles")
+    .select("user_id, allow_messages_from")
+    .eq("user_id", targetUserId)
+    .maybeSingle();
+  if (targetProfileError && !isSchemaMismatchError(targetProfileError)) throw targetProfileError;
+
+  const messagePolicy = targetProfile?.allow_messages_from || "everyone";
+  if (messagePolicy === "none") {
+    throw new Error("This user is not accepting new messages");
+  }
+
+  if (messagePolicy === "following") {
+    const { data: followRow, error: followError } = await supabase
+      .from("follows")
+      .select("id")
+      .eq("follower_id", senderUserId)
+      .eq("following_id", targetUserId)
+      .maybeSingle();
+    if (followError) throw followError;
+    if (!followRow) {
+      throw new Error("You can message this user only after following");
+    }
+  }
+};
+
 export type ConversationSettings = {
   pinned: boolean;
   muted: boolean;
   archived: boolean;
+  accepted_request: boolean;
 };
 
 export function useConversations(includeArchived = false) {
@@ -83,20 +135,37 @@ export function useConversations(includeArchived = false) {
         });
       }
 
-      const [blocksRes, mutesRes] = await Promise.all([
+      const [blocksRes, mutesRes, followingRes] = await Promise.all([
         supabase.from("user_blocks").select("blocked_user_id").eq("user_id", user!.id),
         supabase.from("user_mutes").select("muted_user_id").eq("user_id", user!.id),
+        supabase.from("follows").select("following_id").eq("follower_id", user!.id),
       ]);
 
       const blockedSet = new Set((blocksRes.data || []).map((row: any) => row.blocked_user_id));
       const mutedSet = new Set((mutesRes.data || []).map((row: any) => row.muted_user_id));
+      const followingSet = new Set((followingRes.data || []).map((row: any) => row.following_id));
 
-      const { data: settingsRows, error: settingsError } = await supabase
+      const settingsAdvanced = await supabase
         .from("conversation_settings")
-        .select("conversation_id, pinned, muted, archived")
+        .select("conversation_id, pinned, muted, archived, accepted_request")
         .eq("user_id", user!.id)
         .in("conversation_id", ids);
-      if (settingsError && !isSchemaMismatchError(settingsError)) throw settingsError;
+
+      let settingsRows: any[] = [];
+      if (settingsAdvanced.error) {
+        if (!isSchemaMismatchError(settingsAdvanced.error)) throw settingsAdvanced.error;
+
+        const settingsFallback = await supabase
+          .from("conversation_settings")
+          .select("conversation_id, pinned, muted, archived")
+          .eq("user_id", user!.id)
+          .in("conversation_id", ids);
+        if (settingsFallback.error && !isSchemaMismatchError(settingsFallback.error)) throw settingsFallback.error;
+        settingsRows = (settingsFallback.data || []).map((row: any) => ({ ...row, accepted_request: false }));
+      } else {
+        settingsRows = settingsAdvanced.data || [];
+      }
+
       const settingsMap = new Map((settingsRows || []).map((row: any) => [row.conversation_id, row]));
 
       const allMessagesAdvanced = await supabase
@@ -121,11 +190,16 @@ export function useConversations(includeArchived = false) {
 
       const lastMessageByConversation = new Map<string, any>();
       const unreadCountByConversation = new Map<string, number>();
+      const hasMyMessageByConversation = new Map<string, boolean>();
 
       for (const message of allMessages) {
         const conversationId = message.conversation_id;
         if (!lastMessageByConversation.has(conversationId)) {
           lastMessageByConversation.set(conversationId, message);
+        }
+
+        if (message.sender_id === user!.id) {
+          hasMyMessageByConversation.set(conversationId, true);
         }
 
         if (message.sender_id === user!.id) continue;
@@ -154,17 +228,29 @@ export function useConversations(includeArchived = false) {
             };
           });
 
-        const settings = settingsMap.get(conversation.id) || { pinned: false, muted: false, archived: false };
+        const settings = settingsMap.get(conversation.id) || { pinned: false, muted: false, archived: false, accepted_request: false };
         const unreadCount = unreadCountByConversation.get(conversation.id) || 0;
+        const lastMessage = lastMessageByConversation.get(conversation.id) || null;
+        const firstOther = otherParticipants[0];
+        const hasMyMessage = hasMyMessageByConversation.get(conversation.id) || false;
+        const isMessageRequest =
+          !!firstOther &&
+          otherParticipants.length === 1 &&
+          !followingSet.has(firstOther.user_id) &&
+          !settings.accepted_request &&
+          !hasMyMessage &&
+          !!lastMessage &&
+          lastMessage.sender_id === firstOther.user_id;
 
         return {
           ...conversation,
-          lastMessage: lastMessageByConversation.get(conversation.id) || null,
+          lastMessage,
           otherParticipants,
           unreadCount,
           isUnread: unreadCount > 0,
           myLastReadAt: myLastReadAt || null,
           settings,
+          isMessageRequest,
           isBlockedOrMuted: otherParticipants.some(
             (participant: any) => blockedSet.has(participant.user_id) || mutedSet.has(participant.user_id),
           ),
@@ -360,6 +446,41 @@ export function useSetTypingStatus() {
   });
 }
 
+export function useTypingConversations(conversationIds: string[]) {
+  const { user } = useAuth();
+
+  const stableIds = [...conversationIds].sort();
+
+  return useQuery({
+    queryKey: ["typing-conversations", user?.id, stableIds],
+    enabled: !!user && stableIds.length > 0,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("typing_status")
+        .select("conversation_id, user_id, is_typing, updated_at")
+        .in("conversation_id", stableIds)
+        .eq("is_typing", true);
+
+      if (error) {
+        if (isSchemaMismatchError(error)) return {} as Record<string, number>;
+        throw error;
+      }
+
+      const cutoff = Date.now() - 20_000;
+      const counts: Record<string, number> = {};
+      (data || []).forEach((row: any) => {
+        if (row.user_id === user?.id) return;
+        const updatedAt = row.updated_at ? new Date(row.updated_at).getTime() : 0;
+        if (updatedAt < cutoff) return;
+        counts[row.conversation_id] = (counts[row.conversation_id] || 0) + 1;
+      });
+
+      return counts;
+    },
+    refetchInterval: 5000,
+  });
+}
+
 export function useSendMessage() {
   const qc = useQueryClient();
   const { user } = useAuth();
@@ -383,6 +504,21 @@ export function useSendMessage() {
       replyToMessageId?: string | null;
     }) => {
       if (!user) throw new Error("Not authenticated");
+
+      const participantsQuery = await supabase
+        .from("conversation_participants")
+        .select("user_id")
+        .eq("conversation_id", conversationId);
+      if (participantsQuery.error && !isSchemaMismatchError(participantsQuery.error)) throw participantsQuery.error;
+
+      const participants = participantsQuery.data || [];
+      const otherParticipants = participants.filter((participant: any) => participant.user_id !== user.id);
+      if (otherParticipants.length === 1) {
+        await ensureCanMessageTarget(user.id, otherParticipants[0].user_id);
+      }
+
+      const mentionUsernames = extractMentionUsernames(content || "");
+      await ensureMentionTargetsAllowMentions(mentionUsernames);
 
       const advancedInsert = await supabase.from("messages").insert({
         conversation_id: conversationId,
@@ -660,6 +796,7 @@ export function useUpdateConversationSettings() {
           pinned: updates.pinned ?? false,
           muted: updates.muted ?? false,
           archived: updates.archived ?? false,
+          accepted_request: updates.accepted_request ?? false,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "conversation_id,user_id" },
@@ -680,6 +817,8 @@ export function useCreateConversation() {
   return useMutation({
     mutationFn: async (targetUserId: string) => {
       if (!user) throw new Error("Not authenticated");
+
+      await ensureCanMessageTarget(user.id, targetUserId);
 
       const { data: myConvos } = await supabase
         .from("conversation_participants")
@@ -743,16 +882,17 @@ export function useCreateConversation() {
 
 export function useSearchUsers(query: string) {
   const { user } = useAuth();
+  const normalizedQuery = normalizeSearchInput(query);
 
   return useQuery({
-    queryKey: ["search-users", query],
-    enabled: !!query && query.length >= 2 && !!user,
+    queryKey: ["search-users", normalizedQuery],
+    enabled: !!normalizedQuery && normalizedQuery.length >= 2 && !!user,
     queryFn: async () => {
       const { data, error } = await supabase
         .from("profiles")
         .select("user_id, username, display_name, avatar_url")
         .neq("user_id", user!.id)
-        .or(`username.ilike.%${query}%,display_name.ilike.%${query}%`)
+        .or(buildOrIlikeClause(["username", "display_name"], normalizedQuery))
         .limit(10);
       if (error) throw error;
       return data;

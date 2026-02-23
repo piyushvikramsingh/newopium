@@ -1,11 +1,22 @@
-import { Search, Play, TrendingUp, Users, EyeOff } from "lucide-react";
-import { useEffect, useState, useMemo } from "react";
+import { Search, Play, TrendingUp, Users, EyeOff, PlusSquare } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { useContinueWatchingVideos, useHideVideo, useTrackVideoEvent, useUnhideVideo, useVideos } from "@/hooks/useData";
+import {
+  useContinueWatchingVideos,
+  useFollowRecommendations,
+  useHideVideo,
+  useLogCreatorRecommendationClick,
+  useLogCreatorRecommendationExposure,
+  useToggleFollow,
+  useTrackVideoEvent,
+  useUnhideVideo,
+  useVideos,
+} from "@/hooks/useData";
 import { useAuth } from "@/hooks/useAuth";
 import { supabase } from "@/integrations/supabase/client";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { buildOrIlikeClause, normalizeSearchInput } from "@/lib/search";
 
 const trendingTags = [
   "dance", "viral", "foodie", "cats",
@@ -17,10 +28,13 @@ function useSearchProfiles(query: string) {
     queryKey: ["search-profiles", query],
     enabled: query.length >= 2,
     queryFn: async () => {
+      const normalized = normalizeSearchInput(query);
+      if (!normalized || normalized.length < 2) return [];
+
       const { data, error } = await supabase
         .from("profiles")
         .select("user_id, username, display_name, avatar_url")
-        .or(`username.ilike.%${query}%,display_name.ilike.%${query}%`)
+        .or(buildOrIlikeClause(["username", "display_name"], normalized))
         .limit(10);
       if (error) throw error;
       return data;
@@ -45,12 +59,18 @@ const Discover = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [activeTag, setActiveTag] = useState<string | null>(null);
+  const isSearching = debouncedSearchQuery.length >= 2;
   const { data: videos } = useVideos();
   const { data: continueWatching = [] } = useContinueWatchingVideos(12);
+  const { data: followRecommendations = [] } = useFollowRecommendations(10, !isSearching);
+  const logCreatorRecoClick = useLogCreatorRecommendationClick();
+  const logCreatorRecoExposure = useLogCreatorRecommendationExposure();
+  const toggleFollow = useToggleFollow();
   const hideVideo = useHideVideo();
   const unhideVideo = useUnhideVideo();
   const trackEvent = useTrackVideoEvent();
   const { data: searchProfiles } = useSearchProfiles(debouncedSearchQuery);
+  const loggedExposureKeysRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -93,7 +113,19 @@ const Discover = () => {
     };
   }, []);
 
-  const isSearching = debouncedSearchQuery.length >= 2;
+  useEffect(() => {
+    if (isSearching) return;
+    if (!followRecommendations.length) return;
+
+    const ids = followRecommendations.map((profile: any) => profile.user_id).filter(Boolean);
+    if (!ids.length) return;
+
+    const key = `discover:${ids.join("|")}`;
+    if (loggedExposureKeysRef.current.has(key)) return;
+    loggedExposureKeysRef.current.add(key);
+
+    void logCreatorRecoExposure.mutateAsync({ suggestedUserIds: ids, surface: "discover" });
+  }, [followRecommendations, isSearching, logCreatorRecoExposure]);
 
   // Filter videos by search query or tag
   const filteredVideos = useMemo(() => {
@@ -127,6 +159,21 @@ const Discover = () => {
   return (
     <div className="min-h-screen bg-background pb-20 pt-safe fade-in">
       <div className="sticky top-0 z-20 bg-background/85 backdrop-blur-xl">
+        <div className="px-4 pb-1 pt-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-lg font-bold text-foreground">Discover</h1>
+              <p className="text-xs text-muted-foreground">Explore clips and creators</p>
+            </div>
+            <button
+              onClick={() => navigate("/create")}
+              className="lift-on-tap rounded-full border border-border bg-background/80 p-2 text-foreground shadow-sm backdrop-blur"
+              aria-label="Create"
+            >
+              <PlusSquare className="h-5 w-5" />
+            </button>
+          </div>
+        </div>
         {/* Search bar */}
         <div className="px-4 py-2">
           <div className="flex items-center gap-3 rounded-xl border border-border bg-secondary px-4 py-3">
@@ -213,7 +260,7 @@ const Discover = () => {
                 {continueWatching.map((video: any) => (
                   <button
                     key={video.id}
-                    onClick={() => navigate("/", { state: { focusVideoId: video.id, focusSource: "discover" } })}
+                    onClick={() => navigate("/clipy", { state: { focusVideoId: video.id, focusSource: "discover" } })}
                     className="lift-on-tap relative h-20 w-14 shrink-0 overflow-hidden rounded-lg bg-secondary"
                   >
                     {video.thumbnail_url ? (
@@ -227,6 +274,75 @@ const Discover = () => {
                       <Play className="h-3 w-3 text-white" fill="white" />
                     </div>
                   </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {!!followRecommendations.length && (
+            <div className="px-4 pb-3">
+              <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                <Users className="h-3.5 w-3.5" /> Suggested creators
+              </p>
+              <div className="scrollbar-hide flex gap-2 overflow-x-auto">
+                {followRecommendations.map((profile: any) => (
+                  <div
+                    key={profile.user_id}
+                    className="w-[170px] shrink-0 rounded-xl border border-border bg-background p-2"
+                  >
+                    <button
+                      onClick={() => {
+                        void logCreatorRecoClick.mutateAsync({
+                          suggestedUserId: profile.user_id,
+                          surface: "discover",
+                        });
+                        navigate(`/profile/${profile.user_id}`);
+                      }}
+                      className="flex w-full items-center gap-2 text-left"
+                    >
+                      <div className="h-9 w-9 overflow-hidden rounded-full bg-secondary">
+                        {profile.avatar_url ? (
+                          <img src={profile.avatar_url} alt="" className="h-full w-full object-cover" />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-xs font-semibold text-muted-foreground">
+                            {(profile.display_name?.[0] || profile.username?.[0] || "U").toUpperCase()}
+                          </div>
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-xs font-semibold text-foreground">
+                          {profile.display_name || "User"}
+                        </p>
+                        <p className="truncate text-[10px] text-muted-foreground">@{profile.username || "user"}</p>
+                      </div>
+                    </button>
+
+                    <button
+                      onClick={async () => {
+                        if (!user) {
+                          navigate("/auth");
+                          return;
+                        }
+
+                        try {
+                          const result = await toggleFollow.mutateAsync({
+                            targetUserId: profile.user_id,
+                            isFollowing: false,
+                            targetIsPrivate: !!profile.is_private,
+                          });
+
+                          if (result === "requested") toast.success("Follow request sent");
+                          else toast.success("Following");
+                        } catch (error: any) {
+                          toast.error(error.message || "Could not follow user");
+                        }
+                      }}
+                      disabled={toggleFollow.isPending}
+                      className="mt-2 w-full rounded-lg bg-primary px-2 py-1.5 text-xs font-semibold text-primary-foreground"
+                    >
+                      {toggleFollow.isPending ? "Please wait..." : profile.is_private ? "Request" : "Follow"}
+                    </button>
+                  </div>
                 ))}
               </div>
             </div>
@@ -247,7 +363,7 @@ const Discover = () => {
           filteredVideos.map((video: any) => (
               <div key={video.id} className="relative aspect-[9/16] overflow-hidden bg-secondary">
                 <button
-                  onClick={() => navigate("/", { state: { focusVideoId: video.id, focusSource: "discover" } })}
+                  onClick={() => navigate("/clipy", { state: { focusVideoId: video.id, focusSource: "discover" } })}
                   className="lift-on-tap h-full w-full text-left"
                 >
                   {video.thumbnail_url ? (

@@ -7,6 +7,20 @@ import CommentsSheet from "@/components/CommentsSheet";
 import { toast } from "sonner";
 import Hls from "hls.js";
 
+const getNetworkTier = (): "slow" | "normal" => {
+  const connection = (navigator as Navigator & {
+    connection?: { saveData?: boolean; effectiveType?: string };
+  }).connection;
+
+  if (!connection) return "normal";
+  if (connection.saveData) return "slow";
+
+  const effectiveType = String(connection.effectiveType || "").toLowerCase();
+  if (effectiveType === "slow-2g" || effectiveType === "2g") return "slow";
+
+  return "normal";
+};
+
 function formatCount(num: number): string {
   if (num >= 1000000) return (num / 1000000).toFixed(1) + "M";
   if (num >= 1000) return (num / 1000).toFixed(1) + "K";
@@ -91,6 +105,8 @@ const VideoCard = ({ video, isLiked, isBookmarked, isActive, isNearActive, isMut
     return music.split(/[\s|,-]/).filter(Boolean)[0] || "trending";
   }, [video.description, video.music]);
 
+  const shouldKeepMediaLoaded = isActive || isNearActive;
+
   const socialProofLabel = useMemo(() => {
     if ((video.likes_count || 0) > 25000 || (video.shares_count || 0) > 4000) {
       return "Exploding now";
@@ -105,10 +121,18 @@ const VideoCard = ({ video, isLiked, isBookmarked, isActive, isNearActive, isMut
   }, [video.comments_count, video.likes_count, video.shares_count]);
 
   useEffect(() => {
-    if (isNearActive) {
+    if (shouldKeepMediaLoaded) {
       setHasLoadedMedia(true);
+      return;
     }
-  }, [isNearActive]);
+
+    if (isPlaying) {
+      setIsPlaying(false);
+    }
+
+    setHasLoadedMedia(false);
+    setMediaError(null);
+  }, [isPlaying, shouldKeepMediaLoaded]);
 
   useEffect(() => {
     return () => {
@@ -283,7 +307,7 @@ const VideoCard = ({ video, isLiked, isBookmarked, isActive, isNearActive, isMut
       toast.success(`Following @${profile?.username || "creator"}`);
       setShowFollowPrompt(false);
     } catch {
-      toast.message("Already following or unable to follow right now");
+      toast.error("Already following or unable to follow right now");
       setShowFollowPrompt(false);
     }
   }, [navigate, profile?.username, toggleFollow, trackEvent, user, video.id, video.user_id]);
@@ -450,13 +474,29 @@ const VideoCard = ({ video, isLiked, isBookmarked, isActive, isNearActive, isMut
       return;
     }
 
+    const networkTier = getNetworkTier();
+    const isSlowNetwork = networkTier === "slow";
+
     const hls = new Hls({
       enableWorker: true,
-      lowLatencyMode: true,
-      maxBufferLength: 18,
-      backBufferLength: 8,
-      maxMaxBufferLength: 30,
+      lowLatencyMode: false,
+      startFragPrefetch: true,
+      maxBufferLength: isSlowNetwork ? 16 : 40,
+      maxMaxBufferLength: isSlowNetwork ? 24 : 60,
+      backBufferLength: isSlowNetwork ? 8 : 16,
+      maxBufferHole: 1,
+      highBufferWatchdogPeriod: 2,
+      nudgeOffset: 0.1,
+      nudgeMaxRetry: 5,
+      capLevelToPlayerSize: true,
+      abrBandWidthFactor: isSlowNetwork ? 0.8 : 0.95,
+      abrBandWidthUpFactor: isSlowNetwork ? 0.55 : 0.7,
     });
+
+    if (isSlowNetwork) {
+      hls.autoLevelCapping = 1;
+      hls.nextAutoLevel = 0;
+    }
 
     hls.loadSource(video.video_url);
     hls.attachMedia(vid);
@@ -728,8 +768,13 @@ const VideoCard = ({ video, isLiked, isBookmarked, isActive, isNearActive, isMut
           disablePictureInPicture
           controlsList="nodownload noplaybackrate"
           muted={isMuted}
-          preload={isActive ? "auto" : "metadata"}
+          preload={shouldKeepMediaLoaded ? "auto" : "metadata"}
           onCanPlay={handleCanPlay}
+          onLoadedData={() => {
+            if (isActive) {
+              void safePlay();
+            }
+          }}
           onError={handleVideoError}
           onStalled={() => setIsPlaying(false)}
           onWaiting={handleWaiting}
